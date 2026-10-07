@@ -38,6 +38,14 @@ await handlers.get("session_start")({}, context);
 const fileTools = ["edit", "find", "grep", "ls", "read", "write"];
 const expectedTools = [...fileTools, "ghostty_context", "ghostty_mcp", "ghostty_propose_command", "ghostty_task_plan", "ghostty_terminal"].sort();
 
+async function nativeTerminalKeyPolicy() {
+  const nativeSource = await fs.readFile(new URL("../../Sources/Features/AI/TerminalAIModel.swift", import.meta.url), "utf8");
+  const guard = nativeSource.match(/Set\(payload\.keys\)\.isSubset\(of: operation == "read" \? \[([^\]]+)\] : \[([^\]]+)\]/);
+  assert.ok(guard, "Locate the actual native terminal-key guard before checking the wire contract");
+  const keys = (value) => new Set([...value.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+  return { read: keys(guard[1]), run: keys(guard[2]) };
+}
+
 test("terminal guidance never presents an approval grant as nested-shell recovery", () => {
   const description = tools.get("ghostty_terminal").description;
   assert.match(description, /grant only permits native-verified local read-only queries in a non-root shell/i);
@@ -497,12 +505,39 @@ test("terminal read uses only the reserved native bridge and accepts empty outpu
   } };
   const read = await tools.get("ghostty_terminal").execute("read", { operation: "read" }, undefined, undefined, native);
   assert.equal(request.title, "ghostty-terminal-v1");
-  assert.deepEqual(request.payload, { operation: "read", timeout: 60 });
+  assert.deepEqual(request.payload, { operation: "read" });
   assert.equal(request.options.timeout, undefined);
   assert.equal(read.details.output, "");
   assert.equal(read.details.cwd, "/remote/work");
   assert.equal(read.isError, false);
   assert.equal(read.content[0].text, 'Directory: "/remote/work"\n(No output)');
+});
+
+test("terminal read wire satisfies the native receiver allowlist regardless of model parameter order", async () => {
+  const nativeReadKeys = (await nativeTerminalKeyPolicy()).read;
+  const requests = [];
+  const native = { ...context, ui: { input: async (title, placeholder, options) => {
+    assert.equal(title, "ghostty-terminal-v1");
+    const payload = JSON.parse(placeholder);
+    requests.push({ payload, options });
+    // Exercise the receiver's actual key policy instead of a success-only mock.
+    if (!Object.keys(payload).every((key) => nativeReadKeys.has(key))) {
+      return JSON.stringify({ output: "", error: "Invalid terminal request." });
+    }
+    return JSON.stringify({ output: "fixture native terminal state", outputCaptured: true });
+  } } };
+  for (const params of [
+    { reason: "查看终端当前状态，确认 shell 就绪", operation: "read" },
+    { operation: "read", reason: "查看终端当前状态，确认 shell 就绪" },
+    { timeout: 12, reason: "检查终端", operation: "read" },
+    { operation: "read", timeout: 12, reason: "检查终端" },
+  ]) {
+    const read = await tools.get("ghostty_terminal").execute("ordered-read", params, undefined, undefined, native);
+    assert.deepEqual(requests.at(-1).payload, { operation: "read" });
+    assert.equal(requests.at(-1).options.timeout, undefined);
+    assert.equal(read.isError, false);
+    assert.match(textContent(read), /fixture native terminal state/);
+  }
 });
 
 test("terminal run preserves native results and exposes failure with output details", async () => {
@@ -619,6 +654,7 @@ test("task budget blocks an unbounded terminal loop", () => {
 
 test("real Pi RPC advertises native bridges and scoped SDK tools and consumes results, failures, and denied access", async () => {
   const requests = [];
+  const nativeKeys = await nativeTerminalKeyPolicy();
   const rpcFile = path.join(workspace, "rpc-sdk.txt");
   await fs.writeFile(rpcFile, "RPC SDK local file evidence\n");
   const verificationRecordID = `native-verification-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -636,7 +672,10 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
     if (last.role !== "tool") {
       let name;
       let args;
-      if (marker.includes("__file_read__")) {
+      if (marker.includes("__terminal_read_ordered__")) {
+        name = "ghostty_terminal";
+        args = { reason: "查看终端当前状态，确认 shell 就绪", operation: "read" };
+      } else if (marker.includes("__file_read__")) {
         name = "read";
         args = { path: "rpc-sdk.txt" };
       } else if (marker.includes("__file_write__") || marker.includes("__file_write_deny__")) {
@@ -758,9 +797,10 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
       }
       if (record.type === "extension_ui_request" && record.method === "input" && record.title === "ghostty-terminal-v1") {
         const request = JSON.parse(record.placeholder);
+        const validKeys = Object.keys(request).every((key) => nativeKeys[request.operation]?.has(key));
         const failed = request.command === "fixture_terminal_failure";
         const denied = request.command === "touch forbidden";
-        const result = denied ? { output: "", error: "Terminal command was denied by the native host." } : {
+        const result = !validKeys ? { output: "", error: "Invalid terminal request." } : denied ? { output: "", error: "Terminal command was denied by the native host." } : {
           output: request.operation === "read" ? "fixture current terminal context" : failed ? "fixture terminal failure" : "fixture terminal output",
           ...(request.operation === "run" ? { exitCode: failed ? 9 : 0 } : {}),
           ...(request.command === "fixture_verification_check" ? { commandId: verificationRecordID } : {}),
@@ -805,7 +845,7 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
   });
   try {
     await wait((record) => record.type === "extension_ui_request" && record.method === "setStatus" && record.statusKey === "ghostty-policy" && record.statusText === "ready");
-    for (const marker of ["__file_read__", "__file_write__", "__file_write_deny__", "__inspect_cpu__", "__suggest__", "__deny__", "__terminal__", "__terminal_fail__", "__legacy_run__", "__legacy_diagnose__", "__mcp__", "__mcp_fail__", "__mcp_deny__", "__plan__", "__context__", "__verify__", "__context_list__"]) {
+    for (const marker of ["__terminal_read_ordered__", "__file_read__", "__file_write__", "__file_write_deny__", "__inspect_cpu__", "__suggest__", "__deny__", "__terminal__", "__terminal_fail__", "__legacy_run__", "__legacy_diagnose__", "__mcp__", "__mcp_fail__", "__mcp_deny__", "__plan__", "__context__", "__verify__", "__context_list__"]) {
       records.length = 0;
       const requestStart = requests.length;
       send({ type: "prompt", id: marker, message: marker });
@@ -821,7 +861,14 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
       assert.ok(records.some((record) => record.type === "message_end" && record.message.role === "assistant" &&
         Array.isArray(record.message.content) && record.message.content.some((item) => item.type === "text" && item.text === "Fixture completed after consuming the tool results.")));
       assert.ok(!records.some((record) => record.type === "extension_ui_request" && record.method === "confirm"));
-      if (marker.startsWith("__file_")) {
+      if (marker === "__terminal_read_ordered__") {
+        assert.equal(executions.length, 1);
+        assert.equal(executions[0].toolName, "ghostty_terminal");
+        assert.equal(executions[0].isError, false);
+        const nativeInput = records.find((record) => record.type === "extension_ui_request" && record.title === "ghostty-terminal-v1");
+        assert.deepEqual(JSON.parse(nativeInput.placeholder), { operation: "read" });
+        assert.ok(turnRequests.some((request) => request.messages.at(-1).role === "tool" && String(request.messages.at(-1).content).includes("fixture current terminal context")));
+      } else if (marker.startsWith("__file_")) {
         assert.equal(executions.length, 1);
         assert.equal(executions[0].toolName, marker === "__file_read__" ? "read" : "write");
         const fileInputs = records.filter((record) => record.type === "extension_ui_request" && record.title === "ghostty-file-v1");

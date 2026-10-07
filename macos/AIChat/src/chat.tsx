@@ -132,6 +132,11 @@ function Markdown() {
 }
 function UserText({ text }: { text: string }) { return <p className="user-text">{text}</p>; }
 
+function formatToolArguments(args: unknown) {
+  return JSON.stringify(args, (_key, value) => value && typeof value === "object" && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])) : value, 2);
+}
+
 function ToolCard({ toolName, args, result, isError }: ToolCallMessagePartProps) {
   const output = result as ToolResult | undefined;
   const running = output?.isRunning === true;
@@ -150,7 +155,7 @@ function ToolCard({ toolName, args, result, isError }: ToolCallMessagePartProps)
     </summary>
     <div className="tool-body">
       {detail && <pre className="tool-command">{detail}</pre>}
-      {!detail && Object.keys(args || {}).length > 0 && <pre>{JSON.stringify(args, null, 2)}</pre>}
+      {!detail && Object.keys(args || {}).length > 0 && <pre>{formatToolArguments(args)}</pre>}
       {output?.text ? <pre className="tool-output">{output.text}</pre> : <p className="muted">{!output ? "Waiting for execution…" : running ? "Waiting for output…" : "No output."}</p>}
       {output?.text && <CopyButton text={output.text} label="Copy output" />}
     </div>

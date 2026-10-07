@@ -9,6 +9,44 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct TerminalAITerminalTests {
+    @Test func terminalReadAcceptsCurrentAndLegacyPiRequestsRegardlessOfKeyOrder() async throws {
+        try await withTerminal { fixture in
+            fixture.assistant.terminalControlAllowed = false
+            let baseline = ghostty_surface_command_state(fixture.surface)
+            let valid = [
+                #"{"reason":"查看终端当前状态，确认 shell 就绪","operation":"read"}"#,
+                #"{"operation":"read","reason":"查看终端当前状态，确认 shell 就绪"}"#,
+                #"{"operation":"read","timeout":60}"#,
+                #"{"timeout":60,"reason":"Check shell readiness","operation":"read"}"#,
+                #"{"operation":"read"}"#
+            ]
+            for wire in valid {
+                let id = UUID().uuidString
+                fixture.assistant.receive([
+                    "type": "extension_ui_request", "id": id, "method": "input",
+                    "title": "ghostty-terminal-v1", "placeholder": wire
+                ])
+                let response = try await fixture.result(for: id)
+                #expect(response["error"] == nil)
+                #expect(response["output"] is String)
+                #expect((response["scope"] as? String)?.contains("Terminal control: Ready") == true)
+                #expect(fixture.assistant.approval == nil)
+            }
+            for payload: [String: Any] in [
+                ["operation": "read", "timeout": 0], ["operation": "read", "timeout": 121],
+                ["operation": "read", "timeout": 1.5], ["operation": "read", "timeout": true],
+                ["operation": "read", "timeout": "60"], ["operation": "read", "reason": 42],
+                ["operation": "read", "command": "touch forbidden"], ["operation": "read", "autoApprove": true]
+            ] {
+                let response = try await fixture.request(payload)
+                #expect(response["error"] is String)
+                #expect(fixture.assistant.approval == nil)
+            }
+            #expect(ghostty_surface_command_state(fixture.surface).started == baseline.started)
+            #expect(!fixture.assistant.terminalControlAllowed)
+        }
+    }
+
     @Test func attachedTerminalRunsInTheSameShellPreservesHumanInputAndStopsOwnedCommands() async throws {
         try await withTerminal { fixture in
             let first = try await fixture.request([

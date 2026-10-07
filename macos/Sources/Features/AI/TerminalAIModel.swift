@@ -1884,9 +1884,17 @@ extension TerminalAIModel {
               let data = wire.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let operation = payload["operation"] as? String, ["read", "run"].contains(operation),
-              Set(payload.keys).isSubset(of: operation == "read" ? ["operation"] : ["operation", "command", "reason", "timeout"]) else {
+              Set(payload.keys).isSubset(of: operation == "read" ? ["operation", "reason", "timeout"] : ["operation", "command", "reason", "timeout"]),
+              payload["reason"] == nil || payload["reason"] is String else {
             sendTerminalResult(id: id, value: ["error": "Invalid terminal request."])
             return
+        }
+        if let timeout = payload["timeout"] {
+            guard let number = timeout as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  let seconds = timeout as? Int, (1...120).contains(seconds) else {
+                sendTerminalResult(id: id, value: ["error": "Terminal timeout must be between 1 and 120 seconds."])
+                return
+            }
         }
         if let view = terminalSurface { refreshTerminalIdentity(from: view) }
         guard isRunning, !stopping else {

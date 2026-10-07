@@ -126,7 +126,7 @@ enum TerminalAIPolicy {
           if (!["read", "run"].includes(params.operation)) throw new Error("Unsupported terminal operation.");
           const timeout = params.timeout ?? 60;
           if (!Number.isInteger(timeout) || timeout < 1 || timeout > 120) throw new Error("Terminal timeout must be between 1 and 120 seconds.");
-          const request = { operation: params.operation, timeout };
+          const request = { operation: params.operation };
           if (params.operation === "run") {
             if (typeof params.command !== "string" || !params.command.trim() || params.command.length > 16384 || /[\x00-\x1f\x7f-\x9f]/.test(params.command)) {
               throw new Error("Provide one complete single-line command, up to 16,384 characters, without control characters.");
@@ -134,6 +134,7 @@ enum TerminalAIPolicy {
             if (typeof params.reason !== "string" || !params.reason.trim()) throw new Error("Explain why this terminal command is needed.");
             request.command = params.command;
             request.reason = params.reason;
+            request.timeout = timeout;
           }
           if (!ctx.hasUI || typeof ctx.ui.input !== "function") throw new Error("Current terminal access requires an active Ghostty connection.");
           if (signal?.aborted) throw new Error("Stopped before requesting terminal access.");

@@ -273,6 +273,50 @@ test("packaged HTML allows local assets and blocks remote execution and connecti
   assert.match(html, /<script src="chat.js"><\/script>/);
 });
 
+test("tool argument display stays stable across reordered snapshots without changing arguments or arrays", async () => {
+  const dom = new JSDOM(html, { runScripts: "outside-only", pretendToBeVisual: true, url: "file:///AIChat/index.html", virtualConsole: new VirtualConsole() });
+  const { window } = dom;
+  Object.assign(window, { ReadableStream, TransformStream, WritableStream, TextDecoder, TextEncoder });
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  window.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  window.IntersectionObserver = class { observe() {} unobserve() {} disconnect() {} };
+  window.HTMLElement.prototype.scrollIntoView = function () {};
+  window.HTMLElement.prototype.scrollTo = function () {};
+  const actions = [];
+  window.webkit = { messageHandlers: { ghosttyAI: { postMessage: (value) => actions.push(value) } } };
+  window.eval(script);
+  const display = () => window.document.querySelector(".tool-body pre")?.textContent;
+  const update = (args, result) => window.ghosttyAI.update({ messages: [{ id: "arguments-message", role: "assistant", content: [{ type: "tool-call", toolCallId: "arguments-tool", toolName: "ghostty_terminal", args, result }] }], isRunning: false, phase: "completed", status: "Complete", prompt: "" });
+  try {
+    await until(() => actions.some((value) => value.type === "ready"));
+    const first = { reason: "查看终端当前状态，确认 shell 就绪", operation: "read" };
+    const firstBefore = JSON.stringify(first);
+    update(first);
+    await until(() => display()?.includes('"operation": "read"'));
+    const expected = '{\n  "operation": "read",\n  "reason": "查看终端当前状态，确认 shell 就绪"\n}';
+    assert.equal(display(), expected);
+    update({ operation: "read", reason: first.reason }, { text: "Ready", isRunning: false, isError: false });
+    await until(() => window.document.querySelector(".tool-state")?.textContent === "Done");
+    assert.equal(display(), expected, "Reordering the same snapshot's object keys must not move displayed fields");
+    assert.equal(JSON.stringify(first), firstBefore, "Rendering must preserve the original argument object and key order");
+
+    const nested = { reason: "Inspect", options: { z: { b: 2, a: 1 }, a: true }, checks: [{ z: 2, a: 1 }, "second", "first"] };
+    const nestedBefore = JSON.stringify(nested);
+    update(nested);
+    await until(() => display()?.includes('"checks"'));
+    const nestedDisplay = display();
+    assert.deepEqual(Object.keys(JSON.parse(nestedDisplay)), ["checks", "options", "reason"]);
+    assert.deepEqual(Object.keys(JSON.parse(nestedDisplay).options), ["a", "z"]);
+    assert.deepEqual(Object.keys(JSON.parse(nestedDisplay).options.z), ["a", "b"]);
+    assert.deepEqual(JSON.parse(nestedDisplay).checks, [{ a: 1, z: 2 }, "second", "first"], "Array order stays meaningful while its object elements use stable keys");
+    update({ checks: [{ a: 1, z: 2 }, "second", "first"], options: { a: true, z: { a: 1, b: 2 } }, reason: "Inspect" }, { text: "Ready", isRunning: true, isError: false });
+    await until(() => window.document.querySelector(".tool-state")?.textContent === "Running");
+    assert.equal(display(), nestedDisplay, "Nested key reordering must also leave the display unchanged");
+    assert.equal(JSON.stringify(nested), nestedBefore);
+    assert.equal(actions.some((value) => value.type === "send" || value.type === "approval"), false, "Formatting snapshots never dispatches execution");
+  } finally { dom.window.close(); }
+});
+
 test("file tools remain local beside SSH and file changes require one reviewed decision", async () => {
   const actions = [];
   const errors = [];
