@@ -361,6 +361,70 @@ test("SDK text reads reject a real FIFO without needing a writer and reject NUL 
   assert.ok(!fixture.requests.some((item) => item.operation === "write"));
 });
 
+test("zero-context grep cannot return matches from oversized or invalid UTF-8 files", async () => {
+  const fixture = await fileFixture();
+  for (const [name, bytes, expected] of [
+    ["oversized-match.txt", Buffer.from("needle oversized\n" + "x".repeat(1024 * 1024)), /1 MiB|1048576|1,048,576/i],
+    ["invalid-match.txt", Buffer.concat([Buffer.from("needle invalid "), Buffer.from([0xc3, 0x28]), Buffer.from("\n")]), /UTF-8.*scope|not valid.*utf-8/i],
+  ]) {
+    const file = path.join(fixture.directory, name);
+    await fs.writeFile(file, bytes);
+    await assert.rejects(tools.get("grep").execute("unreadable-match", { path: file, pattern: "needle", literal: true, context: 0 }, undefined, undefined, fixture.context), expected);
+  }
+  assert.ok(!fixture.requests.some((item) => item.operation === "write"));
+});
+
+test("zero-context grep returns verified local match text and neighboring lines", async () => {
+  const fixture = await fileFixture();
+  const file = path.join(fixture.directory, "small-match.txt");
+  await fs.writeFile(file, "before verified neighbor\nneedle matched 中文\nafter verified neighbor\n");
+  const result = await tools.get("grep").execute("verified-match", { path: file, pattern: "needle", literal: true, context: 0 }, undefined, undefined, fixture.context);
+  const text = textContent(result);
+  assert.match(text, /needle matched 中文/);
+  assert.match(text, /before verified neighbor/);
+  assert.match(text, /after verified neighbor/);
+  assert.ok(text.startsWith(`Host: This Mac\nLocal workspace: ${JSON.stringify(result.details.root)}\nPath: ${JSON.stringify(await fs.realpath(file))}\n\n`));
+  assert.deepEqual(fixture.requests.map((item) => item.operation), ["check"]);
+});
+
+test("grep ignores a working ripgrep config that follows outside symlinks and executes a preprocessor", async () => {
+  const fixture = await fileFixture();
+  await fs.writeFile(path.join(fixture.directory, "local.txt"), "needle LOCAL_VERIFIED_FIXTURE\n");
+  const outside = path.join(temporary, `rg-outside-${randomUUID()}.txt`);
+  await fs.writeFile(outside, "needle OUTSIDE_SYMLINK_PRIVATE_FIXTURE\n");
+  await fs.symlink(outside, path.join(fixture.directory, "linked-outside.txt"));
+  const sentinel = path.join(temporary, `rg-pre-ran-${randomUUID()}`);
+  const processor = path.join(temporary, `rg-pre-${randomUUID()}.sh`);
+  const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
+  await fs.writeFile(processor, `#!/bin/sh\n: > ${quote(sentinel)}\nexec /bin/cat "$1"\n`, { mode: 0o700 });
+  const config = path.join(temporary, `rg-config-${randomUUID()}`);
+  await fs.writeFile(config, `--follow\n--pre=${processor}\n`);
+  const originalConfig = process.env.RIPGREP_CONFIG_PATH;
+  try {
+    process.env.RIPGREP_CONFIG_PATH = config;
+    // Confirm this fixture actually activates the unsafe SDK defaults. Every
+    // file and subprocess here is fixture-owned, with no real project access.
+    const sdk = await import(pathToFileURL(path.join(packagePath, "dist/index.js")));
+    const baseline = await sdk.createGrepToolDefinition(fixture.directory).execute("config-baseline", {
+      path: fixture.directory, pattern: "needle", literal: true, context: 0,
+    }, undefined, undefined, fixture.context);
+    assert.match(textContent(baseline), /OUTSIDE_SYMLINK_PRIVATE_FIXTURE/);
+    assert.equal((await fs.stat(sentinel)).isFile(), true, "The preprocessor config is effective in the uncontrolled SDK baseline");
+    await fs.rm(sentinel);
+    process.env.RIPGREP_CONFIG_PATH = config;
+    const result = await tools.get("grep").execute("config-ignored", {
+      path: fixture.directory, pattern: "needle", literal: true, context: 0,
+    }, undefined, undefined, fixture.context);
+    assert.match(textContent(result), /LOCAL_VERIFIED_FIXTURE/);
+    assert.ok(!textContent(result).includes("OUTSIDE_SYMLINK_PRIVATE_FIXTURE"));
+    await assert.rejects(fs.stat(sentinel), { code: "ENOENT" });
+    assert.ok(!fixture.requests.some((item) => item.operation === "write"));
+  } finally {
+    if (originalConfig === undefined) delete process.env.RIPGREP_CONFIG_PATH;
+    else process.env.RIPGREP_CONFIG_PATH = originalConfig;
+  }
+});
+
 test("a replaced workspace directory cannot expand the session scope even when its pathname stays the same", async () => {
   const fixture = await fileFixture();
   const original = path.join(fixture.directory, "original.txt");

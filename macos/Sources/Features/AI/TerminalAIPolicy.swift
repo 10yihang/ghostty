@@ -199,7 +199,7 @@ enum TerminalAIPolicy {
         pi.registerTool({
           ...template, label: { read: "Read file", ls: "List directory", find: "Find files", grep: "Search files", edit: "Edit file", write: "Write file" }[name],
           executionMode: "sequential",
-          description: `THIS MAC ONLY: ${name === "read" ? "Read UTF-8 text files with optional line offset and limit." : template.description} Files are limited to 1 MiB within Ghostty's selected local workspace. These tools do not access an SSH host; use ghostty_terminal for remote files. Edit and write require a native diff approval for each change.`,
+          description: `THIS MAC ONLY: ${name === "read" ? "Read UTF-8 text files with optional line offset and limit." : template.description} ${name === "grep" ? "Results include at least one verified context line; inherited ripgrep configuration is ignored." : ""} Files are limited to 1 MiB within Ghostty's selected local workspace. These tools do not access an SSH host; use ghostty_terminal for remote files. Edit and write require a native diff approval for each change.`,
           async execute(id, params, signal, onUpdate, ctx) {
             if (signal?.aborted) throw new Error("Stopped before accessing a file.");
             const root = workspaceRoot;
@@ -215,12 +215,15 @@ enum TerminalAIPolicy {
               try { originalSHA256 = digest(await readBytes(root, target)); }
               catch (error) { if (name !== "write" || error.code !== "ENOENT") throw error; }
             }
+            let searchReadError;
             const operations = {
               access: async (value) => { await scopedPath(root, value); },
               readFile: async (value) => {
-                const bytes = await readBytes(root, value);
-                if (name === "edit") originalSHA256 = digest(bytes);
-                return name === "grep" ? bytes.toString("utf8") : bytes;
+                try {
+                  const bytes = await readBytes(root, value);
+                  if (name === "edit") originalSHA256 = digest(bytes);
+                  return name === "grep" ? bytes.toString("utf8") : bytes;
+                } catch (error) { if (name === "grep") searchReadError = error; throw error; }
               },
               exists: async (value) => { try { await scopedPath(root, value); return true; } catch { return false; } },
               stat: async (value) => fs.lstat(await scopedPath(root, value)),
@@ -236,7 +239,17 @@ enum TerminalAIPolicy {
               },
             };
             const tool = factory(root, { operations });
-            const response = await tool.execute(id, { ...params, path: target }, signal, onUpdate, ctx);
+            const input = { ...params, path: target };
+            if (name === "grep") {
+              // The SDK's zero-context branch returns raw rg text without calling
+              // readFile. Context rendering checks every matching file instead.
+              input.context = Math.max(1, params.context ?? 0);
+              // This is our private Pi process; user rg preprocessing/follow flags
+              // cannot change the scoped tool or execute unreviewed helpers.
+              delete process.env.RIPGREP_CONFIG_PATH;
+            }
+            const response = await tool.execute(id, input, signal, onUpdate, ctx);
+            if (searchReadError) throw new Error(`A search result cannot be read within the UTF-8, 1 MiB local workspace scope: ${searchReadError.message}`);
             const content = response.content.map((item, index) => index === 0 && item.type === "text" ? {
               ...item, text: `Host: This Mac\nLocal workspace: ${JSON.stringify(root)}\nPath: ${JSON.stringify(target)}\n\n${item.text}`,
             } : item);

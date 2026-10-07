@@ -37,6 +37,9 @@ native host. Native diff review happens before any workspace file or directory m
 then checks the original again and atomically commits the approved bytes.
 Denial, Stop, a changed workspace or a stale file cannot apply a reviewed edit.
 Search uses Pi's installed `rg`/`fd`; missing tools report an error.
+Search results include at least one context line so every matched file passes
+the scoped text reader. Ripgrep configuration is ignored in the private agent
+process; preprocessing and symlink-follow options cannot change this tool.
 
 Proposal-only command entry still enables only `ghostty_propose_command`.
 Pi's standalone `bash`, PowerShell and user-installed extensions remain disabled;
