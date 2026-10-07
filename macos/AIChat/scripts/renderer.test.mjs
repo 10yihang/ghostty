@@ -273,6 +273,85 @@ test("packaged HTML allows local assets and blocks remote execution and connecti
   assert.match(html, /<script src="chat.js"><\/script>/);
 });
 
+test("file tools remain local beside SSH and file changes require one reviewed decision", async () => {
+  const actions = [];
+  const errors = [];
+  const console = new VirtualConsole();
+  console.on("jsdomError", (error) => errors.push(error));
+  const dom = new JSDOM(html, { runScripts: "outside-only", pretendToBeVisual: true, url: "file:///AIChat/index.html", virtualConsole: console });
+  const { window } = dom;
+  Object.assign(window, { ReadableStream, TransformStream, WritableStream, TextDecoder, TextEncoder });
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  window.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  window.IntersectionObserver = class { observe() {} unobserve() {} disconnect() {} };
+  window.HTMLElement.prototype.scrollIntoView = function () {};
+  window.HTMLElement.prototype.scrollTo = function (options) { this.scrollTop = options?.top ?? this.scrollTop; };
+  window.webkit = { messageHandlers: { ghosttyAI: { postMessage: (value) => actions.push(value) } } };
+  window.eval(script);
+  const document = window.document;
+  const button = (label) => [...document.querySelectorAll("button")].find((node) => node.getAttribute("aria-label") === label || node.textContent === label);
+  let snapshot = {
+    messages: [], isRunning: true, phase: "executing", status: "Reading local files", prompt: "",
+    terminalIdentity: { host: "build-host", directory: "/srv/app", isRemote: true, canRun: true, readiness: "Ready" },
+    fileWorkspace: "/Users/fixture/project",
+  };
+  const update = (patch) => { snapshot = { ...snapshot, ...patch }; window.ghosttyAI.update(snapshot); };
+  try {
+    await until(() => actions.some((value) => value.type === "ready"));
+    window.ghosttyAI.update(snapshot);
+    button("Show available tools").click();
+    await until(() => document.querySelector('[aria-label="Available tools"]'));
+    assert.match(document.querySelector('[aria-label="Available tools"]').textContent, /has not reported its available tools/);
+    assert.equal(document.querySelectorAll(".available-tools li").length, 0, "The inventory must not advertise tools absent from the native snapshot");
+    update({ availableTools: [
+      { name: "ghostty_terminal", label: "Terminal", scope: "Current terminal · build-host", description: "Read and run in the attached terminal." },
+      { name: "read", label: "Read file", scope: "This Mac", description: "Read files in the local workspace." },
+      { name: "edit", label: "Edit file", scope: "This Mac · approval required", description: "Preview and approve changes before applying them." },
+    ] });
+    await until(() => document.querySelectorAll(".available-tools li").length === 3);
+    assert.match(document.querySelector(".terminal-identity").textContent, /build-hostSSH/);
+    assert.match(document.querySelector(".file-workspace").textContent, /This Mac\/Users\/fixture\/project/);
+    assert.equal(document.querySelectorAll(".available-tools li")[0].querySelector(".tool-target").textContent, "Current terminal · build-host");
+    assert.equal(document.querySelectorAll(".available-tools li")[1].querySelector(".tool-target").textContent, "This Mac");
+    assert.ok(!document.querySelector(".available-tools").textContent.includes("write"));
+
+    const fileNames = ["read", "ls", "find", "grep", "edit", "write"];
+    update({ messages: [{ id: "file-assistant", role: "assistant", content: fileNames.map((name) => ({ type: "tool-call", toolCallId: `file-${name}`, toolName: name, args: { path: "/Users/fixture/project/config.txt" } })) }] });
+    await until(() => document.querySelectorAll(".tool-card").length === fileNames.length);
+    for (const card of document.querySelectorAll(".tool-card")) {
+      assert.equal(card.querySelector(".tool-target").textContent, "This Mac", "An SSH terminal must not change a file tool's target");
+      assert.equal(card.querySelector(".tool-detail").textContent, "/Users/fixture/project/config.txt");
+      assert.equal(card.querySelector(".tool-state").textContent, "Preparing");
+    }
+    const preview = "--- config.txt\n+++ config.txt\n@@ -1 +1 @@\n-old\n+<new value>";
+    update({ approval: { id: "file-review-1", title: "Edit local file", message: "Review this change before applying it.", target: "This Mac", path: "/Users/fixture/project/config.txt", preview }, phase: "waiting_approval" });
+    await until(() => document.querySelector(".approval-preview"));
+    assert.equal(document.querySelector('[aria-label="File change preview"]').textContent, preview);
+    assert.equal(document.querySelector(".approval-preview").children.length, 0, "Diff text is displayed without executing markup");
+    assert.match(document.querySelector(".approval-target").textContent, /This Mac\/Users\/fixture\/project\/config.txt/);
+    assert.equal(actions.filter((value) => value.type === "approval").length, 0, "Showing the preview never approves a file mutation");
+    const allow = button("Allow this action");
+    const decline = button("Decline");
+    allow.click();
+    allow.click();
+    decline.click();
+    assert.deepEqual(actions.filter((value) => value.type === "approval").map((value) => ({ id: value.id, allow: value.allow })), [{ id: "file-review-1", allow: true }], "Only the first decision is dispatched, including before React rerenders");
+    await tick();
+    assert.equal(button("Allow this action").disabled, true);
+    update({ approval: { id: "file-review-2", title: "Write local file", message: "Create a new file?", target: "This Mac", path: "/Users/fixture/project/new.txt", preview: "+new file" } });
+    await until(() => document.querySelector(".approval-preview").textContent === "+new file");
+    allow.click();
+    assert.equal(actions.filter((value) => value.type === "approval").length, 1, "An old review cannot approve a new request");
+    button("Decline").click();
+    assert.equal(actions.filter((value) => value.type === "approval").at(-1).id, "file-review-2");
+    assert.equal(actions.filter((value) => value.type === "approval").at(-1).allow, false);
+    button("Show available tools").click();
+    await until(() => !document.querySelector('[aria-label="Available tools"]'));
+    assert.equal(button("Show available tools").getAttribute("aria-expanded"), "false");
+    assert.equal(errors.length, 0, errors.map((error) => error.message).join("\n"));
+  } finally { dom.window.close(); }
+});
+
 test("workbench keeps command evidence, workflow parameters, attachments and remote readiness actionable", async () => {
   const actions = [];
   const errors = [];

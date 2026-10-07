@@ -9,7 +9,7 @@ remain working. Commands execute visibly in the currently attached terminal.
 | Command history and associated output | Two successive real PTY commands have distinct exact commands/output/exit/duration/cwd/host; empty output does not reuse older content; failed command explanation attaches only that record; records survive app/model restart. |
 | Lightweight command entry | Configurable shortcut/native entry generates an editable command with execution tools unavailable; Fill preserves empty-prompt checks and does not submit; Run requests approval and executes in the same PTY. |
 | Troubleshooting task panel | Agent can publish/update a plan; UI shows steps/evidence; success verification is tied to actual completed command records and cannot be fabricated solely by a model string. |
-| Project context attachments | User can attach files/logs/project instructions/Git diff with preview/remove/source identity/bounds; attached data reaches Pi; unattached paths are not tools; remote context reads use the attached remote shell. |
+| Project context attachments | User can attach files/logs/project instructions/Git diff with preview/remove/source identity/bounds; the context tool accepts only attached IDs; local workspace files also have dedicated file tools; remote context reads use the attached remote shell. |
 | Reusable workflows | Save/edit/delete/search/use a workflow, fill parameters, persist across restart; selected workflow reaches the agent and its commands retain normal approval/terminal binding. |
 | MCP integration | Configure/enable/test stdio and HTTP servers; discover tools/resources; call tools/read resources through a separately approved bridge; handle JSON/SSE/session/error/cancel/timeout; real local protocol fixtures prove behavior. |
 | SSH experience | Show reported host/directory/readiness honestly; changed host cancels stale approvals/grants; remote integration setup is explicit and visible; SSH PTY fixture or equivalent authentic host/control evidence proves same-session execution. |
@@ -19,6 +19,28 @@ stores, compact renderer/native entry, and the native MCP client/Pi bridge.
 Completion requires source audit, targeted core tests, frontend DOM tests, native
 models/transport tests, real isolated terminal runs and native rendered artifacts.
 No issue or PR is created. Current dirty work is preserved.
+
+## Local Pi file tools
+
+Normal AI conversations enable Pi's `read`, `ls`, `find`, `grep`, `edit` and
+`write` tools alongside Ghostty's terminal, proposal, plan, context and MCP
+tools. The Tools browser shows the actual enabled inventory and local workspace.
+File cards always identify **This Mac**, including beside an SSH terminal.
+Remote file operations continue through reviewed commands in that same remote
+terminal; Pi's local workspace is not an SSH filesystem.
+
+Local file paths must resolve within the selected workspace. Reads are bounded
+to regular files up to 1 MiB; use terminal `head`/`tail` for larger logs.
+Pi supplies its existing tool schemas, search, truncation and precise edit
+matching. `edit` and `write` send their final contents and original hash to the
+native host. Native diff review happens before any workspace file or directory mutation,
+then checks the original again and atomically commits the approved bytes.
+Denial, Stop, a changed workspace or a stale file cannot apply a reviewed edit.
+Search uses Pi's installed `rg`/`fd`; missing tools report an error.
+
+Proposal-only command entry still enables only `ghostty_propose_command`.
+Pi's standalone `bash`, PowerShell and user-installed extensions remain disabled;
+shell commands use the current Ghostty terminal and its existing approval rules.
 
 ## Verification status
 

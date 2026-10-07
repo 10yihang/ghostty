@@ -23,13 +23,14 @@ type Attachment = { id: string; name: string; kind: string; preview: string; lin
 type Workflow = { id: string; name: string; description: string; prompt: string; parameters: { name: string; defaultValue: string }[] };
 type Task = { id: string; title: string; steps: { id: string; title: string; status: string; evidence: string }[]; verification?: { status: string; summary: string; evidence: string } };
 type TerminalIdentity = { host: string; directory: string; isRemote: boolean; readiness: string; canRun: boolean; canSetupShell?: boolean };
+type AvailableTool = { name: string; label: string; scope: string; description: string };
 type Snapshot = {
   messages: NativeMessage[];
   isRunning: boolean;
   phase: string;
   status: string;
   startedAt?: number;
-  approval?: { id: string; title: string; message: string };
+  approval?: { id: string; title: string; message: string; target?: string; path?: string; preview?: string };
   error?: string;
   configurationIssue?: string;
   prompt: string;
@@ -46,6 +47,8 @@ type Snapshot = {
   task?: Task;
   workflows: Workflow[];
   terminalIdentity?: TerminalIdentity;
+  availableTools?: AvailableTool[];
+  fileWorkspace?: string;
   contextLoading: boolean;
   workflowSaveResult?: { requestID: string; success: boolean; error?: string; workflowID?: string };
 };
@@ -133,12 +136,14 @@ function ToolCard({ toolName, args, result, isError }: ToolCallMessagePartProps)
   const output = result as ToolResult | undefined;
   const running = output?.isRunning === true;
   const failed = isError || output?.isError;
-  const detail = output?.detail || (typeof args?.command === "string" ? args.command : "");
+  const detail = output?.detail || (typeof args?.command === "string" ? args.command : typeof args?.path === "string" ? args.path : "");
   const label = output?.label || toolName;
+  const localFile = ["read", "ls", "find", "grep", "edit", "write"].includes(toolName);
   return <details className={`tool-card ${failed ? "tool-error" : ""}`} data-tool-name={toolName}>
     <summary>
       {running ? <span className="activity-dot" /> : failed ? <Icon name="alert" /> : !output ? <span className="status-dot" /> : <Icon name="check" />}
       <span className="tool-label">{label}</span>
+      {localFile && <span className="tool-target" title="File tools operate on this Mac, including when the attached terminal is using SSH.">This Mac</span>}
       <span className="tool-detail" title={detail}>{detail}</span>
       <span className="tool-state">{running ? "Running" : failed ? "Failed" : !output ? "Preparing" : "Done"}</span>
       <Icon name="chevron" className="disclosure-icon" />
@@ -184,12 +189,21 @@ function RunStatus({ snapshot }: { snapshot: Snapshot }) {
 
 function Approval({ value }: { value: NonNullable<Snapshot["approval"]> }) {
   const [answered, setAnswered] = useState(false);
+  const answeredRef = useRef(false);
+  const decide = (allow: boolean) => {
+    if (answeredRef.current || currentSnapshot.approval?.id !== value.id) return;
+    answeredRef.current = true;
+    setAnswered(true);
+    action({ type: "approval", id: value.id, allow });
+  };
   return <section className="approval" aria-label="Action needs approval">
     <div className="approval-title"><Icon name="alert" /><strong>{value.title || "Approve this action"}</strong></div>
+    {(value.target || value.path) && <p className="approval-target"><span>{value.target || "This Mac"}</span>{value.path && <code>{value.path}</code>}</p>}
     <pre>{value.message}</pre>
+    {value.preview !== undefined && <pre className="approval-preview" aria-label="File change preview">{value.preview}</pre>}
     <div className="approval-actions"><span className="muted">{answered ? "Sending decision…" : "Agent is waiting for your decision."}</span>
-      <button type="button" disabled={answered} onClick={() => { setAnswered(true); action({ type: "approval", id: value.id, allow: false }); }}>Decline</button>
-      <button className="primary" type="button" disabled={answered} onClick={() => { setAnswered(true); action({ type: "approval", id: value.id, allow: true }); }}>Allow this action</button>
+      <button type="button" disabled={answered} onClick={() => decide(false)}>Decline</button>
+      <button className="primary" type="button" disabled={answered} onClick={() => decide(true)}>Allow this action</button>
     </div>
   </section>;
 }
@@ -278,11 +292,19 @@ function WorkflowBrowser({ snapshot }: { snapshot: Snapshot }) {
   </section>;
 }
 
+function ToolBrowser({ snapshot }: { snapshot: Snapshot }) {
+  const tools = snapshot.availableTools || [];
+  return <section className="workbench-browser" aria-label="Available tools">
+    {snapshot.fileWorkspace && <p className="file-workspace"><span>File tools · This Mac</span><code>{snapshot.fileWorkspace}</code></p>}
+    {tools.length === 0 ? <p className="muted browser-note">The agent has not reported its available tools yet.</p> : <ul className="available-tools">{tools.map((tool) => <li key={tool.name}><div><strong>{tool.label}</strong><span className="tool-target">{tool.scope}</span></div><p>{tool.description}</p><code>{tool.name}</code></li>)}</ul>}
+  </section>;
+}
+
 function Workbench({ snapshot }: { snapshot: Snapshot }) {
-  const [tab, setTab] = useState<"commands" | "workflows">();
+  const [tab, setTab] = useState<"commands" | "workflows" | "tools">();
   const identity = snapshot.terminalIdentity;
   const recovery = identity?.canSetupShell && <button type="button" disabled={snapshot.contextLoading} title="At an idle shell prompt, copy integration for this shell. Finish a foreground program first. Automatic query approval never bypasses shell integration." onClick={() => { if (currentSnapshot.terminalIdentity?.canSetupShell && !currentSnapshot.contextLoading) action({ type: "ssh_setup" }); }}>Connect shell…</button>;
-  return <div className="workbench"><div className="workbench-toolbar"><span className={`terminal-identity ${identity?.canRun === false ? "unready" : ""}`} title={identity ? `${identity.host} · ${identity.directory}\n${identity.readiness}` : "Attached terminal"}><Icon name="terminal" /><span>{identity?.host || "Attached terminal"}</span>{identity?.isRemote && <small>SSH</small>}</span><button type="button" aria-label="Show command history" aria-expanded={tab === "commands"} className={tab === "commands" ? "selected" : ""} onClick={() => setTab(tab === "commands" ? undefined : "commands")}>Commands{snapshot.commands.length > 0 && <small>{snapshot.commands.length}</small>}</button><button type="button" aria-label="Show workflows" aria-expanded={tab === "workflows"} className={tab === "workflows" ? "selected" : ""} onClick={() => setTab(tab === "workflows" ? undefined : "workflows")}>Workflows</button></div>{identity?.canRun === false && <div className="terminal-readiness" role="status"><span title={identity.readiness}>{identity.canSetupShell ? "Shell prompt not verified" : identity.readiness}</span>{recovery}</div>}{tab === "commands" && <CommandBrowser snapshot={snapshot} />}{tab === "workflows" && <WorkflowBrowser snapshot={snapshot} />}{!tab && snapshot.task && <TaskPanel task={snapshot.task} />}</div>;
+  return <div className="workbench"><div className="workbench-toolbar"><span className={`terminal-identity ${identity?.canRun === false ? "unready" : ""}`} title={identity ? `${identity.host} · ${identity.directory}\n${identity.readiness}` : "Attached terminal"}><Icon name="terminal" /><span>{identity?.host || "Attached terminal"}</span>{identity?.isRemote && <small>SSH</small>}</span><button type="button" aria-label="Show command history" aria-expanded={tab === "commands"} className={tab === "commands" ? "selected" : ""} onClick={() => setTab(tab === "commands" ? undefined : "commands")}>Commands{snapshot.commands.length > 0 && <small>{snapshot.commands.length}</small>}</button><button type="button" aria-label="Show workflows" aria-expanded={tab === "workflows"} className={tab === "workflows" ? "selected" : ""} onClick={() => setTab(tab === "workflows" ? undefined : "workflows")}>Workflows</button><button type="button" aria-label="Show available tools" aria-expanded={tab === "tools"} className={tab === "tools" ? "selected" : ""} onClick={() => setTab(tab === "tools" ? undefined : "tools")}>Tools</button></div>{identity?.canRun === false && <div className="terminal-readiness" role="status"><span title={identity.readiness}>{identity.canSetupShell ? "Shell prompt not verified" : identity.readiness}</span>{recovery}</div>}{tab === "commands" && <CommandBrowser snapshot={snapshot} />}{tab === "workflows" && <WorkflowBrowser snapshot={snapshot} />}{tab === "tools" && <ToolBrowser snapshot={snapshot} />}{!tab && snapshot.task && <TaskPanel task={snapshot.task} />}</div>;
 }
 
 function Chat() {

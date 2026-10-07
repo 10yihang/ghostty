@@ -3,7 +3,8 @@ import Foundation
 /// Ghostty-owned Pi sessions run commands only in their bound terminal.
 /// Native authorization controls execution; proposals never execute.
 enum TerminalAIPolicy {
-    static let toolNames = "ghostty_terminal,ghostty_propose_command,ghostty_mcp,ghostty_task_plan,ghostty_context"
+    static let toolNames = "ghostty_terminal,ghostty_propose_command,ghostty_mcp,ghostty_task_plan,ghostty_context,read,ls,find,grep,edit,write"
+    static let fileToolNames = ["read", "ls", "find", "grep", "edit", "write"]
     static let commandToolNames = "ghostty_propose_command"
 
     static func install(in directory: URL) throws -> URL {
@@ -16,12 +17,19 @@ enum TerminalAIPolicy {
     static let source = #"""
     import { Type } from "typebox";
     import fs from "node:fs/promises";
+    import { constants } from "node:fs";
+    import path from "node:path";
+    import { createHash } from "node:crypto";
+    import * as sdk from "@mariozechner/pi-coding-agent";
 
     const commandMode = process.env.GHOSTTY_AI_MODE === "command";
-    const names = new Set(commandMode ? ["ghostty_propose_command"] : ["ghostty_terminal", "ghostty_propose_command", "ghostty_mcp", "ghostty_task_plan", "ghostty_context"]);
+    const fileNames = ["read", "ls", "find", "grep", "edit", "write"];
+    const names = new Set(commandMode ? ["ghostty_propose_command"] : ["ghostty_terminal", "ghostty_propose_command", "ghostty_mcp", "ghostty_task_plan", "ghostty_context", ...fileNames]);
     const maxOutput = 32768;
     let toolCalls = 0;
     let taskStarted = 0;
+    let workspaceRoot;
+    let workspaceIdentity;
     const result = (text, details = {}, isError = false) => ({
       content: [{ type: "text", text }], details, isError,
     });
@@ -38,6 +46,41 @@ enum TerminalAIPolicy {
       return result(text.slice(0, maxOutput) + (text.length > maxOutput ? "\n[Output truncated to 32,768 characters.]" : ""), response, response.isError === true);
     };
 
+    const fileResult = async (params, signal, ctx) => (await nativeBridge("ghostty-file-v1", params, signal, ctx)).details;
+    const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
+    const inside = (root, target) => {
+      const relative = path.relative(root, target);
+      return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
+    };
+    const scopedPath = async (root, value, missing = false) => {
+      if (typeof value !== "string" || !value || value.includes("\0")) throw new Error("Provide a local workspace path.");
+      let target = path.resolve(root, value);
+      const suffix = [];
+      for (;;) {
+        try { target = path.join(await fs.realpath(target), ...suffix); break; }
+        catch (error) {
+          if (!missing || error.code !== "ENOENT" || target === path.dirname(target)) throw error;
+          suffix.unshift(path.basename(target)); target = path.dirname(target);
+        }
+      }
+      if (!inside(root, target)) throw new Error("A symbolic link leaves the local workspace.");
+      return target;
+    };
+    const readBytes = async (root, value) => {
+      const target = await scopedPath(root, value);
+      const handle = await fs.open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const stat = await handle.stat();
+        // ponytail: cap files at 1 MiB; use terminal head/tail for larger logs.
+        if (!stat.isFile() || stat.size > 1048576) throw new Error("Choose a regular local file up to 1 MiB.");
+        const bytes = await handle.readFile();
+        if (bytes.length > 1048576) throw new Error("The file grew beyond the 1 MiB limit.");
+        if (bytes.includes(0)) throw new Error("Choose a UTF-8 text file.");
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        return bytes;
+      } finally { await handle.close(); }
+    };
+
     export default function (pi) {
       pi.on("session_start", async (_event, ctx) => {
         const configured = process.env.GHOSTTY_AI_WORKSPACE;
@@ -45,6 +88,9 @@ enum TerminalAIPolicy {
         const workspace = await fs.realpath(configured);
         if (!(await fs.stat(workspace)).isDirectory()) throw new Error("The local task directory is not a folder.");
         if (await fs.realpath(ctx.cwd) !== workspace) throw new Error("Pi and Ghostty task directories differ.");
+        const identity = await fs.stat(workspace, { bigint: true });
+        workspaceRoot = workspace;
+        workspaceIdentity = `${identity.dev}:${identity.ino}`;
         ctx.ui.setStatus("ghostty-policy", "ready");
       });
 
@@ -69,7 +115,7 @@ enum TerminalAIPolicy {
 
       if (!commandMode) pi.registerTool({
         name: "ghostty_terminal", label: "Use current terminal", executionMode: "sequential",
-        description: "The only command execution tool. Read output from or visibly run one complete single-line command in the bound Ghostty terminal. All diagnostics, file inspection, process/CPU checks, and repairs that require a command must use run here. A run uses the current shell's aliases, environment, directory, and SSH connection when shell integration can verify an empty prompt, with no foreground program or pending user input. The Auto-approve queries task grant only permits native-verified local read-only queries in a non-root shell to skip individual approval. Changes, deletion, overwrites, privilege escalation, permissions, signals, service restarts, database writes, scripts, complex or unknown commands, SSH and root shells always require separate native approval. The native host decides eligibility; never claim a command is safe to waive review, or split/rewrite commands to avoid approval. Approving a reviewed shell command clears automatic query approval, because it may change the shell configuration; the user must enable it again for later queries. For eligible queries the native host uses a fixed verified executable with literal arguments in the same terminal to avoid aliases, functions and PATH overrides; always send the original complete command for native assessment. A grant does not bypass shell integration or empty-prompt checks. After SSH, su or sudo su opens an unintegrated nested shell, explain Connect shell: the user copies the setup for the current Bash/zsh shell, pastes it at its idle prompt and presses Enter. Alternatively the user may manually exit to an integrated parent. Never suggest a grant as the solution to missing integration, or inject setup/exit into an unverified prompt. No separate local shell or silent fallback. If native access fails, report the error and ask the user to resolve it. Do not use for interactive programs or multiline input.",
+        description: "The only command execution tool. Read output from or visibly run one complete single-line command in the bound Ghostty terminal. Shell diagnostics, remote file inspection, process/CPU checks, and repairs that require a command must use run here. Dedicated file tools handle local workspace files. A run uses the current shell's aliases, environment, directory, and SSH connection when shell integration can verify an empty prompt, with no foreground program or pending user input. The Auto-approve queries task grant only permits native-verified local read-only queries in a non-root shell to skip individual approval. Changes, deletion, overwrites, privilege escalation, permissions, signals, service restarts, database writes, scripts, complex or unknown commands, SSH and root shells always require separate native approval. The native host decides eligibility; never claim a command is safe to waive review, or split/rewrite commands to avoid approval. Approving a reviewed shell command clears automatic query approval, because it may change the shell configuration; the user must enable it again for later queries. For eligible queries the native host uses a fixed verified executable with literal arguments in the same terminal to avoid aliases, functions and PATH overrides; always send the original complete command for native assessment. A grant does not bypass shell integration or empty-prompt checks. After SSH, su or sudo su opens an unintegrated nested shell, explain Connect shell: the user copies the setup for the current Bash/zsh shell, pastes it at its idle prompt and presses Enter. Alternatively the user may manually exit to an integrated parent. Never suggest a grant as the solution to missing integration, or inject setup/exit into an unverified prompt. No separate local shell or silent fallback. If native access fails, report the error and ask the user to resolve it. Do not use for interactive programs or multiline input.",
         parameters: Type.Object({
           operation: Type.Union([Type.Literal("read"), Type.Literal("run")]),
           command: Type.Optional(Type.String({ minLength: 1, maxLength: 16384, description: "One complete single-line command for run; no control characters." })),
@@ -145,6 +191,59 @@ enum TerminalAIPolicy {
       });
 
       if (commandMode) return;
+
+      for (const name of fileNames) {
+        const factory = sdk[`create${name[0].toUpperCase() + name.slice(1)}ToolDefinition`];
+        if (typeof factory !== "function") throw new Error(`This Pi version does not support the ${name} file tool. Update Pi before enabling file access.`);
+        const template = factory(process.env.GHOSTTY_AI_WORKSPACE);
+        pi.registerTool({
+          ...template, label: { read: "Read file", ls: "List directory", find: "Find files", grep: "Search files", edit: "Edit file", write: "Write file" }[name],
+          executionMode: "sequential",
+          description: `THIS MAC ONLY: ${name === "read" ? "Read UTF-8 text files with optional line offset and limit." : template.description} Files are limited to 1 MiB within Ghostty's selected local workspace. These tools do not access an SSH host; use ghostty_terminal for remote files. Edit and write require a native diff approval for each change.`,
+          async execute(id, params, signal, onUpdate, ctx) {
+            if (signal?.aborted) throw new Error("Stopped before accessing a file.");
+            const root = workspaceRoot;
+            if (!root) throw new Error("The local file workspace is not ready.");
+            const identity = await fs.stat(root, { bigint: true });
+            if (await fs.realpath(process.env.GHOSTTY_AI_WORKSPACE) !== root ||
+                await fs.realpath(ctx.cwd) !== root || `${identity.dev}:${identity.ino}` !== workspaceIdentity) throw new Error("The file workspace changed.");
+            const target = await scopedPath(root, params.path || ".", name === "write");
+            const checked = await fileResult({ operation: "check", tool: name, path: target }, signal, ctx);
+            if (checked.root !== root || checked.path !== target) throw new Error("Ghostty and Pi file targets differ.");
+            let originalSHA256 = null;
+            if (["edit", "write"].includes(name)) {
+              try { originalSHA256 = digest(await readBytes(root, target)); }
+              catch (error) { if (name !== "write" || error.code !== "ENOENT") throw error; }
+            }
+            const operations = {
+              access: async (value) => { await scopedPath(root, value); },
+              readFile: async (value) => {
+                const bytes = await readBytes(root, value);
+                if (name === "edit") originalSHA256 = digest(bytes);
+                return name === "grep" ? bytes.toString("utf8") : bytes;
+              },
+              exists: async (value) => { try { await scopedPath(root, value); return true; } catch { return false; } },
+              stat: async (value) => fs.lstat(await scopedPath(root, value)),
+              readdir: async (value) => fs.readdir(await scopedPath(root, value)),
+              isDirectory: async (value) => (await fs.lstat(await scopedPath(root, value))).isDirectory(),
+              // Pi calls mkdir before writeFile; native approval owns every mutation.
+              mkdir: async () => {},
+              writeFile: async (value, content) => {
+                if (signal?.aborted) throw new Error("Stopped before requesting a file change.");
+                const resolved = await scopedPath(root, value, name === "write");
+                if (resolved !== target) throw new Error("The file target changed.");
+                await fileResult({ operation: "write", path: target, content, originalSHA256 }, signal, ctx);
+              },
+            };
+            const tool = factory(root, { operations });
+            const response = await tool.execute(id, { ...params, path: target }, signal, onUpdate, ctx);
+            const content = response.content.map((item, index) => index === 0 && item.type === "text" ? {
+              ...item, text: `Host: This Mac\nLocal workspace: ${JSON.stringify(root)}\nPath: ${JSON.stringify(target)}\n\n${item.text}`,
+            } : item);
+            return { ...response, content, details: { ...response.details, host: "This Mac", scope: "Local workspace", path: target, root } };
+          },
+        });
+      }
 
       pi.registerTool({
         name: "ghostty_mcp", label: "Use MCP tools", executionMode: "sequential",

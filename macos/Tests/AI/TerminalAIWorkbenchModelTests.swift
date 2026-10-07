@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Testing
 @testable import Ghostty
 
@@ -13,13 +14,85 @@ struct TerminalAIWorkbenchModelTests {
         #expect(configuration.environment["GHOSTTY_AI_MODE"] == "command")
         fixture.begin("Write a command")
         #expect(fixture.model.taskPlan == nil)
-        for (title, id) in [("ghostty-terminal-v1", "terminal"), ("ghostty-mcp-v1", "mcp"), ("ghostty-context-v1", "context")] {
+        for (title, id) in [("ghostty-terminal-v1", "terminal"), ("ghostty-mcp-v1", "mcp"), ("ghostty-context-v1", "context"), ("ghostty-file-v1", "file")] {
             try fixture.request(title: title, id: id, payload: ["operation": "run", "command": "touch forbidden", "reason": "fixture"])
             #expect(try fixture.response(id)["error"] is String)
         }
         #expect(fixture.model.approval == nil)
         #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("forbidden").path))
         #expect((fixture.recording.commands.first { $0["type"] as? String == "prompt" }?["message"] as? String)?.contains("do not execute anything") == true)
+    }
+
+    @Test func fileToolsAdvertiseTheirLocalScopeAndChangesRequireExactDiffApproval() async throws {
+        let fixture = try WorkbenchModelFixture()
+        defer { fixture.remove() }
+        let file = fixture.directory.appendingPathComponent("review.txt")
+        let before = "before 中文\n"
+        try before.write(to: file, atomically: true, encoding: .utf8)
+        fixture.begin("Edit the local fixture")
+        fixture.model.terminalControlAllowed = true
+        let enabled = try #require(fixture.model.webSnapshot["availableTools"] as? [[String: String]])
+        #expect(Set(enabled.map { $0["name"] ?? "" }) == Set(TerminalAIPolicy.toolNames.split(separator: ",").map(String.init)))
+        #expect(enabled.filter { TerminalAIPolicy.fileToolNames.contains($0["name"] ?? "") }.allSatisfy { $0["scope"]?.contains("This Mac") == true })
+        try fixture.request(title: "ghostty-file-v1", id: "check", payload: ["operation": "check", "tool": "read", "path": file.path])
+        #expect(try fixture.response("check")["host"] as? String == "This Mac")
+        #expect(try fixture.response("check")["root"] as? String == fixture.directory.resolvingSymlinksInPath().path)
+        fixture.model.receive(["type": "tool_execution_start", "toolCallId": "read-card", "toolName": "read", "args": ["path": "review.txt"]])
+        fixture.model.receive(["type": "tool_execution_end", "toolCallId": "read-card", "toolName": "read", "result": [
+            "content": [["type": "text", "text": "Host: This Mac\n\(before)"]], "details": ["path": file.resolvingSymlinksInPath().path]
+        ]])
+        let messages = try #require(fixture.model.webSnapshot["messages"] as? [[String: Any]])
+        let parts = messages.flatMap { $0["content"] as? [[String: Any]] ?? [] }
+        let card = try #require(parts.first { $0["toolCallId"] as? String == "read-card" }?["result"] as? [String: Any])
+        #expect(card["label"] as? String == "Read file")
+        #expect(card["detail"] as? String == file.resolvingSymlinksInPath().path)
+        for tool in ["ls", "find", "grep"] {
+            try fixture.request(title: "ghostty-file-v1", id: tool, payload: ["operation": "check", "tool": tool, "path": fixture.directory.path])
+            #expect(try fixture.response(tool)["error"] == nil)
+            #expect(try fixture.response(tool)["path"] as? String == fixture.directory.resolvingSymlinksInPath().path)
+        }
+        try fixture.request(title: "ghostty-file-v1", id: "outside", payload: ["operation": "check", "tool": "read", "path": "/etc/passwd"])
+        #expect(try fixture.response("outside")["error"] is String)
+        let hash = SHA256.hash(data: Data(before.utf8)).map { String(format: "%02x", $0) }.joined()
+        let payload: [String: Any] = ["operation": "write", "path": file.path, "content": "after 中文\n", "originalSHA256": hash]
+        try fixture.request(title: "ghostty-file-v1", id: "denied", payload: payload)
+        try await fixture.wait { fixture.model.approval?.id == "denied" }
+        let approval = try #require(fixture.model.webSnapshot["approval"] as? [String: Any])
+        #expect(approval["target"] as? String == "This Mac")
+        #expect((approval["preview"] as? String)?.contains("-before 中文") == true)
+        #expect((approval["preview"] as? String)?.contains("+after 中文") == true)
+        #expect(try String(contentsOf: file, encoding: .utf8) == before)
+        fixture.model.respondToApproval(allow: false)
+        #expect(try fixture.response("denied")["error"] is String)
+        #expect(try String(contentsOf: file, encoding: .utf8) == before)
+        try fixture.request(title: "ghostty-file-v1", id: "approved", payload: payload)
+        try await fixture.wait { fixture.model.approval?.id == "approved" }
+        fixture.model.respondToApproval(allow: true)
+        #expect(try fixture.response("approved")["error"] == nil)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "after 中文\n")
+        #expect(!fixture.model.terminalControlAllowed)
+    }
+
+    @Test func staleOrStoppedFileApprovalNeverWritesOrCreatesDirectories() async throws {
+        let fixture = try WorkbenchModelFixture()
+        defer { fixture.remove() }
+        fixture.begin("Prepare a file change")
+        let file = fixture.directory.appendingPathComponent("draft.txt")
+        try "original\n".write(to: file, atomically: true, encoding: .utf8)
+        let hash = SHA256.hash(data: Data("original\n".utf8)).map { String(format: "%02x", $0) }.joined()
+        try fixture.request(title: "ghostty-file-v1", id: "stale", payload: ["operation": "write", "path": file.path, "content": "agent\n", "originalSHA256": hash])
+        try await fixture.wait { fixture.model.approval?.id == "stale" }
+        try "human\n".write(to: file, atomically: true, encoding: .utf8)
+        fixture.model.respondToApproval(allow: true)
+        #expect(try fixture.response("stale")["error"] is String)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "human\n")
+        let newFile = fixture.directory.appendingPathComponent("new-parent/new-file.txt")
+        try fixture.request(title: "ghostty-file-v1", id: "stopped", payload: ["operation": "write", "path": newFile.path, "content": "must not exist", "originalSHA256": NSNull()])
+        try await fixture.wait { fixture.model.approval?.id == "stopped" }
+        fixture.model.stop()
+        fixture.model.respondToApproval(allow: true)
+        #expect(try fixture.response("stopped")["error"] is String)
+        #expect(!FileManager.default.fileExists(atPath: newFile.deletingLastPathComponent().path))
     }
 
     @Test func explicitFilesAndProjectContextReachOnlyTheAttachmentBridge() throws {

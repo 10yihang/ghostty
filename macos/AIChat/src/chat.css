@@ -64,6 +64,7 @@ code,pre,.command-editor { font-family:ui-monospace,SFMono-Regular,Menlo,monospa
 summary::-webkit-details-marker { display:none; }
 .tool-card summary:hover { background:var(--surface); }
 .tool-label { font-weight:500; font-size:12px; flex:none; }
+.tool-target { color:var(--muted); font-size:10px; line-height:1.4; border:1px solid var(--border); border-radius:3px; padding:1px 4px; flex:none; }
 .tool-detail { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; color:var(--muted); }
 .tool-state { font-size:11px; color:var(--muted); margin-left:auto; }
 .tool-error .tool-state,.tool-error > summary > .icon:first-child { color:var(--error); }
@@ -80,6 +81,9 @@ details[open] > summary .disclosure-icon,details[open] > summary > .icon:first-c
 .approval { border-top:1px solid var(--border); padding:9px 14px; background:var(--surface); max-height:40%; overflow-y:auto; flex-shrink:0; }
 .approval-title { display:flex; align-items:center; gap:7px; color:var(--accent); font-size:12px; }
 .approval pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:6px 0 8px; max-height:95px; overflow:auto; }
+.approval-target { display:flex; flex-wrap:wrap; gap:2px 8px; margin:6px 0; color:var(--muted); font-size:11px; }
+.approval-target code { overflow-wrap:anywhere; font-size:11px; }
+.approval .approval-preview { max-height:200px; padding:7px 9px; border:1px solid var(--border); border-radius:4px; background:var(--code); white-space:pre; overflow-wrap:normal; }
 .approval-actions { display:flex; align-items:center; justify-content:flex-end; gap:7px; font-size:11px; }
 .approval-actions .muted { margin-right:auto; }
 .error-message,.configuration-issue { display:flex; align-items:center; gap:8px; padding:7px 14px; font-size:12px; border-top:1px solid var(--border); flex-shrink:0; }
@@ -123,6 +127,14 @@ details[open] > summary .disclosure-icon,details[open] > summary > .icon:first-c
 .browser-filter label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:11px; }
 .browser-filter button { font-size:11px; }
 .browser-note { margin:8px 12px; font-size:12px; }
+.file-workspace { display:flex; flex-direction:column; gap:2px; margin:7px 12px; color:var(--muted); font-size:11px; }
+.file-workspace code { overflow-wrap:anywhere; font-size:11px; }
+.available-tools { list-style:none; margin:0; padding:0; }
+.available-tools li { padding:7px 12px; border-top:1px solid var(--border); }
+.available-tools li > div { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.available-tools strong { font-size:12px; font-weight:500; }
+.available-tools p { margin:3px 0; font-size:11px; color:var(--muted); }
+.available-tools code { font-size:10px; color:var(--muted); }
 .command-record { border-bottom:1px solid var(--border); }
 .command-record:last-child { border-bottom:0; }
 .command-record > summary { display:flex; gap:8px; align-items:center; padding:7px 12px; cursor:pointer; }

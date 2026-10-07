@@ -3,11 +3,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 
 const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "ghostty-policy-test-"));
 const workspace = path.join(temporary, "workspace");
@@ -15,18 +17,26 @@ await fs.mkdir(workspace);
 const source = await fs.readFile(new URL("../../Sources/Features/AI/TerminalAIPolicy.swift", import.meta.url), "utf8");
 const extension = source.match(/static let source = #"""\n([\s\S]*?)\n    """#/)[1].replace(/^    /gm, "");
 const packagePath = process.env.GHOSTTY_PI_PACKAGE || "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
-await fs.symlink(path.join(packagePath, "node_modules"), path.join(temporary, "node_modules"));
+// Keep SDK aliases inside the fixture; never add aliases to the user's Pi installation.
+const fixtureModules = path.join(temporary, "node_modules");
+await fs.mkdir(fixtureModules);
+await fs.symlink(path.join(packagePath, "node_modules/typebox"), path.join(fixtureModules, "typebox"));
+for (const scope of ["@mariozechner", "@earendil-works"]) {
+  await fs.mkdir(path.join(fixtureModules, scope));
+  await fs.symlink(packagePath, path.join(fixtureModules, scope, "pi-coding-agent"));
+}
+process.env.GHOSTTY_AI_WORKSPACE = workspace;
 await fs.writeFile(path.join(temporary, "policy.mjs"), extension);
 const { default: register } = await import(pathToFileURL(path.join(temporary, "policy.mjs")));
 const tools = new Map();
 const handlers = new Map();
 register({ on: (name, handler) => handlers.set(name, handler), registerTool: (tool) => tools.set(tool.name, tool) });
-process.env.GHOSTTY_AI_WORKSPACE = workspace;
 let ready = false;
 const context = { cwd: workspace, hasUI: true, ui: { setStatus: () => { ready = true; }, confirm: async () => false } };
 await handlers.get("session_start")({}, context);
 
-const expectedTools = ["ghostty_context", "ghostty_mcp", "ghostty_propose_command", "ghostty_task_plan", "ghostty_terminal"];
+const fileTools = ["edit", "find", "grep", "ls", "read", "write"];
+const expectedTools = [...fileTools, "ghostty_context", "ghostty_mcp", "ghostty_propose_command", "ghostty_task_plan", "ghostty_terminal"].sort();
 
 test("terminal guidance never presents an approval grant as nested-shell recovery", () => {
   const description = tools.get("ghostty_terminal").description;
@@ -41,11 +51,11 @@ test("terminal guidance never presents an approval grant as nested-shell recover
   assert.match(description, /Connect shell/i);
 });
 
-test("only bounded native tools are enabled; legacy local tools are blocked", () => {
+test("only native bridges and scoped SDK file tools are enabled; shell and legacy tools stay blocked", () => {
   assert.equal(ready, true);
   assert.deepEqual([...tools.keys()].sort(), expectedTools);
   assert.equal(source.match(/static let toolNames = "([^"]+)"/)[1].split(",").sort().join(","), expectedTools.join(","));
-  for (const toolName of ["ghostty_diagnose", "ghostty_run_command", "bash", "read", "write", "edit", "exec"]) {
+  for (const toolName of ["ghostty_diagnose", "ghostty_run_command", "bash", "powershell", "exec"]) {
     assert.equal(tools.has(toolName), false);
     assert.equal(handlers.get("tool_call")({ toolName }).block, true);
   }
@@ -121,6 +131,295 @@ test("command suggestions do not execute shell input", async () => {
   const proposal = await tools.get("ghostty_propose_command").execute("suggest", { command, explanation: "Example" });
   assert.equal(proposal.details.command, command);
   await assert.rejects(fs.stat(path.join(workspace, "should-not-exist")), { code: "ENOENT" });
+});
+
+const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const textContent = (value) => value.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+const editInput = (file, oldText, newText) => tools.get("edit").parameters.properties.edits
+  ? { path: file, edits: [{ oldText, newText }] } : { path: file, oldText, newText };
+async function fileFixture() {
+  const requestedDirectory = path.join(workspace, `sdk-files-${randomUUID()}`);
+  await fs.mkdir(requestedDirectory);
+  const directory = await fs.realpath(requestedDirectory);
+  const root = await fs.realpath(workspace);
+  const requests = [];
+  const fixture = { directory, requests, denyCheck: false, denyWrite: false, cancelWrite: false, beforeWrite: undefined };
+  fixture.context = { ...context, ui: { input: async (title, placeholder, options) => {
+    assert.equal(title, "ghostty-file-v1", "File access uses its native bridge, never the terminal or shell bridge");
+    const request = JSON.parse(placeholder);
+    requests.push({ ...request, signal: options.signal });
+    assert.equal(path.isAbsolute(request.path), true);
+    assert.ok(request.path === root || request.path.startsWith(root + path.sep), "Native receives a path inside the selected local workspace");
+    if (request.operation === "check") {
+      assert.ok(fileTools.includes(request.tool));
+      return JSON.stringify(fixture.denyCheck ? { error: "Local file access denied by native host." } : {
+        path: request.path, root, host: "This Mac", scope: "Local workspace", output: "Fixture local workspace checked.",
+      });
+    }
+    assert.equal(request.operation, "write");
+    assert.equal(typeof request.content, "string");
+    let original;
+    try { original = await fs.readFile(request.path); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    assert.equal(request.originalSHA256, original === undefined ? null : hash(original));
+    await fixture.beforeWrite?.(request, original);
+    if (fixture.cancelWrite) return undefined;
+    if (fixture.denyWrite) return JSON.stringify({ error: "File write denied by native host." });
+    // This fixture models the native host applying approved bytes. SDK callbacks
+    // may prepare a proposal, but must not mutate files or create directories.
+    await fs.mkdir(path.dirname(request.path), { recursive: true });
+    await fs.writeFile(request.path, request.content);
+    return JSON.stringify({ output: "File saved.", path: request.path, host: "This Mac", scope: "Local workspace" });
+  } } };
+  return fixture;
+}
+
+test("SDK read, ls, find and grep retain their real results and explicitly local scope", async () => {
+  const fixture = await fileFixture();
+  const file = path.join(fixture.directory, "alpha.txt");
+  const nested = path.join(fixture.directory, "nested");
+  await fs.mkdir(nested);
+  await fs.writeFile(file, "first line\nneedle β second\nlast line\n");
+  await fs.writeFile(path.join(nested, "other.txt"), "nested needle evidence\n");
+  for (const name of fileTools) assert.match(tools.get(name).description, /local|This Mac/i);
+  const read = await tools.get("read").execute("sdk-read", { path: file, offset: 2, limit: 1 }, undefined, undefined, fixture.context);
+  assert.match(textContent(read), /needle β second/);
+  assert.ok(!textContent(read).includes("first line"), "SDK offset/limit remain effective");
+  const listed = await tools.get("ls").execute("sdk-ls", { path: fixture.directory }, undefined, undefined, fixture.context);
+  assert.match(textContent(listed), /alpha\.txt/);
+  assert.match(textContent(listed), /nested/);
+  const found = await tools.get("find").execute("sdk-find", { path: fixture.directory, pattern: "*.txt" }, undefined, undefined, fixture.context);
+  assert.match(textContent(found), /alpha\.txt/);
+  const searched = await tools.get("grep").execute("sdk-grep", { path: fixture.directory, pattern: "needle", literal: true, context: 1 }, undefined, undefined, fixture.context);
+  assert.match(textContent(searched), /alpha\.txt/);
+  assert.match(textContent(searched), /needle β second/);
+  assert.match(textContent(searched), /nested needle evidence/);
+  for (const result of [read, listed, found, searched]) {
+    assert.equal(result.details.host, "This Mac");
+    assert.equal(result.details.scope, "Local workspace");
+    assert.equal(result.details.root, await fs.realpath(workspace));
+    assert.equal(result.content[0].type, "text");
+    assert.ok(result.content[0].text.startsWith(`Host: This Mac\nLocal workspace: ${JSON.stringify(result.details.root)}\nPath: ${JSON.stringify(result.details.path)}\n\n`), "The provider receives scope in tool content, not only private details");
+  }
+  assert.deepEqual(fixture.requests.map((item) => item.operation), ["check", "check", "check", "check"]);
+  assert.deepEqual(fixture.requests.map((item) => item.tool), ["read", "ls", "find", "grep"]);
+});
+
+test("SDK file tools reject traversal and symlink escapes instead of reading or changing outside files", async () => {
+  const fixture = await fileFixture();
+  const outside = path.join(temporary, `outside-${randomUUID()}`);
+  await fs.mkdir(outside);
+  const secret = path.join(outside, "secret.txt");
+  const contents = "OUTSIDE_WORKSPACE_PRIVATE_FIXTURE";
+  await fs.writeFile(secret, contents);
+  const link = path.join(fixture.directory, "outside-link");
+  await fs.symlink(outside, link);
+  const calls = [
+    ["read", { path: secret }],
+    ["read", { path: path.relative(workspace, secret) }],
+    ["read", { path: path.join(link, "secret.txt") }],
+    ["ls", { path: link }],
+    ["find", { path: link, pattern: "*.txt" }],
+    ["grep", { path: link, pattern: contents, literal: true }],
+    ["write", { path: path.join(link, "new", "forbidden.txt"), content: "must not create" }],
+    ["edit", editInput(path.join(link, "secret.txt"), contents, "must not edit")],
+  ];
+  for (const [name, params] of calls) {
+    await assert.rejects(tools.get(name).execute("escape", params, undefined, undefined, fixture.context), /workspace|scope|outside|escape/i);
+  }
+  assert.equal(await fs.readFile(secret, "utf8"), contents);
+  await assert.rejects(fs.stat(path.join(outside, "new")), { code: "ENOENT" });
+  assert.ok(!fixture.requests.some((item) => item.operation === "write"));
+});
+
+test("SDK write submits exact bytes and the original hash; only native approval creates parents or changes a file", async () => {
+  const fixture = await fileFixture();
+  const destination = path.join(fixture.directory, "new-parent", "command.txt");
+  const content = "中文 🐧\r\n$(literal file content)\n";
+  let release;
+  const approved = new Promise((resolve) => { release = resolve; });
+  let pending;
+  fixture.beforeWrite = async (request, original) => {
+    pending = request;
+    assert.equal(original, undefined);
+    await assert.rejects(fs.stat(path.dirname(destination)), { code: "ENOENT" });
+    await approved;
+  };
+  const operation = tools.get("write").execute("sdk-write-new", { path: destination, content }, undefined, undefined, fixture.context);
+  for (let attempt = 0; !pending && attempt < 100; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(pending, "The SDK must wait for native write approval");
+  assert.equal(pending.content, content);
+  assert.equal(pending.originalSHA256, null);
+  await assert.rejects(fs.stat(destination), { code: "ENOENT" });
+  release();
+  const result = await operation;
+  assert.match(textContent(result), /wrote|saved/i);
+  assert.deepEqual(await fs.readFile(destination), Buffer.from(content));
+  fixture.beforeWrite = async (request, original) => {
+    assert.deepEqual(original, Buffer.from(content));
+    assert.equal(request.originalSHA256, hash(Buffer.from(content)));
+    assert.equal(await fs.readFile(destination, "utf8"), content, "JS must not overwrite before native applies the proposal");
+  };
+  await tools.get("write").execute("sdk-write-existing", { path: destination, content: "replacement\n" }, undefined, undefined, fixture.context);
+  assert.equal(await fs.readFile(destination, "utf8"), "replacement\n");
+  assert.equal(fixture.requests.filter((item) => item.operation === "write").length, 2);
+});
+
+test("SDK edit preserves BOM and CRLF, returns its diff, and sends exact original bytes for conflict checks", async () => {
+  const fixture = await fileFixture();
+  const file = path.join(fixture.directory, "edit.txt");
+  const before = "\uFEFFfirst 中文\r\nsecond needle\r\n";
+  const after = "\uFEFFfirst 中文\r\nsecond changed 🐧\r\n";
+  await fs.writeFile(file, before);
+  fixture.beforeWrite = async (request, original) => {
+    assert.deepEqual(original, Buffer.from(before));
+    assert.equal(request.originalSHA256, hash(Buffer.from(before)));
+    assert.equal(request.content, after);
+    assert.equal(await fs.readFile(file, "utf8"), before);
+  };
+  const edited = await tools.get("edit").execute("sdk-edit", editInput(file, "second needle", "second changed 🐧"), undefined, undefined, fixture.context);
+  assert.deepEqual(await fs.readFile(file), Buffer.from(after));
+  assert.match(edited.details.diff, /second changed 🐧/);
+  assert.match(textContent(edited), /replaced|edited|saved/i);
+  const writes = fixture.requests.filter((item) => item.operation === "write").length;
+  await assert.rejects(tools.get("edit").execute("sdk-edit-missing", editInput(file, "does not exist", "must not change"), undefined, undefined, fixture.context), /match|find|text/i);
+  assert.equal(fixture.requests.filter((item) => item.operation === "write").length, writes);
+  assert.deepEqual(await fs.readFile(file), Buffer.from(after));
+});
+
+test("native denial and cancellation leave SDK write/edit targets and missing parent directories untouched", async () => {
+  const fixture = await fileFixture();
+  const existing = path.join(fixture.directory, "existing.txt");
+  const before = "keep these bytes 中文\n";
+  await fs.writeFile(existing, before);
+  fixture.denyWrite = true;
+  for (const [name, params] of [
+    ["write", { path: path.join(fixture.directory, "never-created", "new.txt"), content: "forbidden" }],
+    ["write", { path: existing, content: "forbidden" }],
+    ["edit", editInput(existing, "keep", "forbidden")],
+  ]) await assert.rejects(tools.get(name).execute("denied", params, undefined, undefined, fixture.context), /denied/i);
+  assert.equal(await fs.readFile(existing, "utf8"), before);
+  await assert.rejects(fs.stat(path.join(fixture.directory, "never-created")), { code: "ENOENT" });
+  fixture.denyWrite = false;
+  fixture.cancelWrite = true;
+  await assert.rejects(tools.get("write").execute("cancelled", { path: existing, content: "forbidden" }, undefined, undefined, fixture.context), /cancel|unknown/i);
+  assert.equal(await fs.readFile(existing, "utf8"), before);
+  fixture.cancelWrite = false;
+  fixture.denyCheck = true;
+  const writes = fixture.requests.filter((item) => item.operation === "write").length;
+  for (const [name, params] of [
+    ["read", { path: existing }], ["ls", { path: fixture.directory }],
+    ["find", { path: fixture.directory, pattern: "*.txt" }], ["grep", { path: fixture.directory, pattern: "keep" }],
+    ["edit", editInput(existing, "keep", "forbidden")], ["write", { path: existing, content: "forbidden" }],
+  ]) await assert.rejects(tools.get(name).execute("scope-denied", params, undefined, undefined, fixture.context), /denied/i);
+  assert.equal(fixture.requests.filter((item) => item.operation === "write").length, writes);
+  assert.equal(await fs.readFile(existing, "utf8"), before);
+});
+
+test("SDK file reads enforce the one MiB boundary before returning file data", async () => {
+  const fixture = await fileFixture();
+  const bounded = path.join(fixture.directory, "one-mib.txt");
+  await fs.writeFile(bounded, "allowed\n" + "x".repeat(1024 * 1024 - 8));
+  const result = await tools.get("read").execute("bounded", { path: bounded, offset: 1, limit: 1 }, undefined, undefined, fixture.context);
+  assert.match(textContent(result), /allowed/);
+  const oversized = path.join(fixture.directory, "oversized.txt");
+  await fs.writeFile(oversized, "a".repeat(1024 * 1024 + 1));
+  await assert.rejects(tools.get("read").execute("oversized", { path: oversized }, undefined, undefined, fixture.context), /1 MiB|1048576|1,048,576|file.*large|limit.*(?:byte|size)/i);
+  assert.ok(!fixture.requests.some((item) => item.operation === "write"));
+});
+
+test("SDK text reads reject a real FIFO without needing a writer and reject NUL or invalid UTF-8 bytes", async () => {
+  const fixture = await fileFixture();
+  const fifo = path.join(fixture.directory, "unwritten.fifo");
+  await new Promise((resolve, reject) => {
+    const child = spawn("/usr/bin/mkfifo", [fifo], { stdio: ["ignore", "ignore", "pipe"] });
+    let errorOutput = "";
+    child.stderr.on("data", (chunk) => { errorOutput += chunk; });
+    child.once("error", reject);
+    child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`mkfifo failed: ${errorOutput}`)));
+  });
+  assert.equal((await fs.lstat(fifo)).isFIFO(), true);
+  let writerWasNeeded = false;
+  // If O_NONBLOCK regresses, release the blocked OS reader so the failed test
+  // can exit; a correct implementation rejects without this fallback writer.
+  const fallback = setTimeout(() => {
+    writerWasNeeded = true;
+    fs.open(fifo, fsConstants.O_WRONLY | fsConstants.O_NONBLOCK).then((handle) => handle.close()).catch(() => {});
+  }, 2000);
+  try {
+    await assert.rejects(tools.get("read").execute("fifo", { path: fifo }, undefined, undefined, fixture.context), /regular local file/i);
+    assert.equal(writerWasNeeded, false, "A FIFO read must reject without waiting for a writer");
+  } finally { clearTimeout(fallback); }
+  for (const [name, bytes, expected] of [
+    ["nul.bin", Buffer.from([65, 0, 66]), /UTF-8 text file/i],
+    ["invalid-utf8.bin", Buffer.from([0xc3, 0x28]), /not valid.*utf-8|UTF-8 text file/i],
+  ]) {
+    const file = path.join(fixture.directory, name);
+    await fs.writeFile(file, bytes);
+    await assert.rejects(tools.get("read").execute("binary", { path: file }, undefined, undefined, fixture.context), expected);
+    assert.deepEqual(await fs.readFile(file), bytes);
+  }
+  assert.ok(!fixture.requests.some((item) => item.operation === "write"));
+});
+
+test("a replaced workspace directory cannot expand the session scope even when its pathname stays the same", async () => {
+  const fixture = await fileFixture();
+  const original = path.join(fixture.directory, "original.txt");
+  await fs.writeFile(original, "Original pinned workspace evidence\n");
+  const identity = await fs.stat(workspace, { bigint: true });
+  const displaced = path.join(temporary, `displaced-workspace-${randomUUID()}`);
+  await fs.rename(workspace, displaced);
+  try {
+    await fs.mkdir(workspace);
+    await fs.writeFile(path.join(workspace, "replacement.txt"), "Replacement directory is not authorized\n");
+    const replacement = await fs.stat(workspace, { bigint: true });
+    assert.ok(identity.dev !== replacement.dev || identity.ino !== replacement.ino);
+    await assert.rejects(tools.get("read").execute("root-replaced", { path: "replacement.txt" }, undefined, undefined, fixture.context), /workspace changed/i);
+    assert.equal(fixture.requests.length, 0, "The replaced root must be rejected before checking or reading its files");
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+    await fs.rename(displaced, workspace);
+  }
+  const restored = await fs.stat(workspace, { bigint: true });
+  assert.equal(restored.dev, identity.dev);
+  assert.equal(restored.ino, identity.ino);
+  const result = await tools.get("read").execute("root-restored", { path: original }, undefined, undefined, fixture.context);
+  assert.match(textContent(result), /Original pinned workspace evidence/);
+});
+
+test("an absolute path through a workspace alias resolves to the same authorized local target", async () => {
+  const fixture = await fileFixture();
+  const file = path.join(fixture.directory, "aliased.txt");
+  await fs.writeFile(file, "Authorized workspace alias evidence\n");
+  const alias = path.join(temporary, `workspace-alias-${randomUUID()}`);
+  await fs.symlink(workspace, alias);
+  const requested = path.join(alias, path.relative(await fs.realpath(workspace), file));
+  const result = await tools.get("read").execute("aliased", { path: requested }, undefined, undefined, fixture.context);
+  assert.match(textContent(result), /Authorized workspace alias evidence/);
+  assert.equal(fixture.requests[0].path, await fs.realpath(file));
+});
+
+test("SDK access rejects a mismatched native target or changed workspace and stops before dispatch when aborted", async () => {
+  const fixture = await fileFixture();
+  const file = path.join(fixture.directory, "guarded.txt");
+  const before = "guarded original bytes\n";
+  await fs.writeFile(file, before);
+  const root = await fs.realpath(workspace);
+  for (const replacement of [{ path: path.join(root, "different.txt"), root }, { path: file, root: temporary }]) {
+    const mismatched = { ...context, ui: { input: async () => JSON.stringify({ ...replacement, host: "This Mac", scope: "Local workspace" }) } };
+    await assert.rejects(tools.get("write").execute("mismatched", { path: file, content: "must not write" }, undefined, undefined, mismatched), /targets differ/i);
+    assert.equal(await fs.readFile(file, "utf8"), before);
+  }
+  const changed = { ...fixture.context, cwd: temporary };
+  await assert.rejects(tools.get("read").execute("changed", { path: file }, undefined, undefined, changed), /workspace changed/i);
+  const controller = new AbortController();
+  controller.abort();
+  for (const [name, params] of [
+    ["read", { path: file }], ["ls", { path: fixture.directory }],
+    ["find", { path: fixture.directory, pattern: "*.txt" }], ["grep", { path: fixture.directory, pattern: "guarded" }],
+    ["edit", editInput(file, "guarded", "must not edit")], ["write", { path: file, content: "must not write" }],
+  ]) await assert.rejects(tools.get(name).execute("stopped", params, controller.signal, undefined, fixture.context), /Stopped before accessing/i);
+  assert.equal(fixture.requests.length, 0, "Changed/stopped access must not ask native approval or dispatch a mutation");
+  assert.equal(await fs.readFile(file, "utf8"), before);
 });
 
 test("terminal read uses only the reserved native bridge and accepts empty output", async () => {
@@ -254,8 +553,10 @@ test("task budget blocks an unbounded terminal loop", () => {
   assert.equal(blocked.terminate, true);
 });
 
-test("real Pi RPC advertises only bounded native tools and consumes results, failures, and denied access", async () => {
+test("real Pi RPC advertises native bridges and scoped SDK tools and consumes results, failures, and denied access", async () => {
   const requests = [];
+  const rpcFile = path.join(workspace, "rpc-sdk.txt");
+  await fs.writeFile(rpcFile, "RPC SDK local file evidence\n");
   const verificationRecordID = `native-verification-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const verifiedInputs = [];
   const server = createServer(async (request, response) => {
@@ -271,7 +572,13 @@ test("real Pi RPC advertises only bounded native tools and consumes results, fai
     if (last.role !== "tool") {
       let name;
       let args;
-      if (marker.includes("__verify__")) {
+      if (marker.includes("__file_read__")) {
+        name = "read";
+        args = { path: "rpc-sdk.txt" };
+      } else if (marker.includes("__file_write__") || marker.includes("__file_write_deny__")) {
+        name = "write";
+        args = { path: marker.includes("__file_write_deny__") ? "rpc-forbidden/new.txt" : "rpc-created/new.txt", content: "Native-approved RPC file bytes 中文\n" };
+      } else if (marker.includes("__verify__")) {
         name = "ghostty_terminal";
         args = { operation: "run", command: "fixture_verification_check", reason: "Run a real verification check before citing its native command ID." };
       } else if (marker.includes("__context_list__")) {
@@ -357,6 +664,21 @@ test("real Pi RPC advertises only bounded native tools and consumes results, fai
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   const send = (record) => child.stdin.write(JSON.stringify(record) + "\n");
+  const fileRPC = async (request) => {
+    const root = await fs.realpath(workspace);
+    assert.ok(request.path === root || request.path.startsWith(root + path.sep));
+    if (request.operation === "check") return {
+      path: request.path, root, host: "This Mac", scope: "Local workspace", output: "RPC local workspace checked.",
+    };
+    assert.equal(request.operation, "write");
+    assert.equal(request.originalSHA256, null);
+    assert.equal(request.content, "Native-approved RPC file bytes 中文\n");
+    await assert.rejects(fs.stat(path.dirname(request.path)), { code: "ENOENT" });
+    if (request.path.includes("rpc-forbidden")) return { error: "RPC native file write denied." };
+    await fs.mkdir(path.dirname(request.path), { recursive: true });
+    await fs.writeFile(request.path, request.content);
+    return { output: "File saved.", path: request.path, host: "This Mac", scope: "Local workspace" };
+  };
   child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-4096); });
   child.stdout.on("data", (chunk) => {
     buffered += chunk;
@@ -381,6 +703,12 @@ test("real Pi RPC advertises only bounded native tools and consumes results, fai
           cwd: "/fixture/terminal", host: "fixture-reported-host", outputCaptured: true,
         };
         send({ type: "extension_ui_response", id: record.id, value: JSON.stringify(result) });
+      }
+      if (record.type === "extension_ui_request" && record.method === "input" && record.title === "ghostty-file-v1") {
+        fileRPC(JSON.parse(record.placeholder)).then(
+          (result) => send({ type: "extension_ui_response", id: record.id, value: JSON.stringify(result) }),
+          (error) => send({ type: "extension_ui_response", id: record.id, value: JSON.stringify({ error: error.message }) }),
+        );
       }
       if (record.type === "extension_ui_request" && record.method === "input" && ["ghostty-mcp-v1", "ghostty-task-plan-v1", "ghostty-context-v1"].includes(record.title)) {
         const request = JSON.parse(record.placeholder);
@@ -413,7 +741,7 @@ test("real Pi RPC advertises only bounded native tools and consumes results, fai
   });
   try {
     await wait((record) => record.type === "extension_ui_request" && record.method === "setStatus" && record.statusKey === "ghostty-policy" && record.statusText === "ready");
-    for (const marker of ["__inspect_cpu__", "__suggest__", "__deny__", "__terminal__", "__terminal_fail__", "__legacy_run__", "__legacy_diagnose__", "__mcp__", "__mcp_fail__", "__mcp_deny__", "__plan__", "__context__", "__verify__", "__context_list__"]) {
+    for (const marker of ["__file_read__", "__file_write__", "__file_write_deny__", "__inspect_cpu__", "__suggest__", "__deny__", "__terminal__", "__terminal_fail__", "__legacy_run__", "__legacy_diagnose__", "__mcp__", "__mcp_fail__", "__mcp_deny__", "__plan__", "__context__", "__verify__", "__context_list__"]) {
       records.length = 0;
       const requestStart = requests.length;
       send({ type: "prompt", id: marker, message: marker });
@@ -429,7 +757,24 @@ test("real Pi RPC advertises only bounded native tools and consumes results, fai
       assert.ok(records.some((record) => record.type === "message_end" && record.message.role === "assistant" &&
         Array.isArray(record.message.content) && record.message.content.some((item) => item.type === "text" && item.text === "Fixture completed after consuming the tool results.")));
       assert.ok(!records.some((record) => record.type === "extension_ui_request" && record.method === "confirm"));
-      if (marker === "__verify__") {
+      if (marker.startsWith("__file_")) {
+        assert.equal(executions.length, 1);
+        assert.equal(executions[0].toolName, marker === "__file_read__" ? "read" : "write");
+        const fileInputs = records.filter((record) => record.type === "extension_ui_request" && record.title === "ghostty-file-v1");
+        assert.deepEqual(fileInputs.map((record) => JSON.parse(record.placeholder).operation), marker === "__file_read__" ? ["check"] : ["check", "write"]);
+        assert.ok(!records.some((record) => record.type === "extension_ui_request" && record.title === "ghostty-terminal-v1"));
+        if (marker === "__file_read__") {
+          assert.equal(executions[0].isError, false);
+          assert.match(textContent(executions[0].result), /RPC SDK local file evidence/);
+        } else if (marker === "__file_write__") {
+          assert.equal(executions[0].isError, false);
+          assert.equal(await fs.readFile(path.join(workspace, "rpc-created/new.txt"), "utf8"), "Native-approved RPC file bytes 中文\n");
+        } else {
+          assert.equal(executions[0].isError, true);
+          assert.match(textContent(executions[0].result), /denied/i);
+          await assert.rejects(fs.stat(path.join(workspace, "rpc-forbidden")), { code: "ENOENT" });
+        }
+      } else if (marker === "__verify__") {
         assert.equal(executions.length, 2);
         assert.deepEqual(executions.map((record) => record.toolName), ["ghostty_terminal", "ghostty_task_plan"]);
         assert.ok(executions.every((record) => !record.isError));
