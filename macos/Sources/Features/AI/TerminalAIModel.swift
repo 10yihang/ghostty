@@ -250,10 +250,7 @@ final class TerminalAIModel: ObservableObject {
 
     var webSnapshot: [String: Any] {
         var snapshot: [String: Any] = [
-            "messages": messages.map { message in
-                ["id": message.id, "role": message.role,
-                 "content": message.content.keys.sorted().compactMap { message.content[$0].map(Self.webContent) }] as [String: Any]
-            },
+            "messages": serializedMessages,
             "isRunning": isRunning, "phase": phase.rawValue, "status": statusLabel,
             "terminalControlAllowed": terminalControlAllowed,
             "queuedInputs": pendingInputs.filter { !$0.displayed && $0.accepted }.map {
@@ -296,6 +293,13 @@ final class TerminalAIModel: ObservableObject {
             snapshot["approval"] = value
         }
         return snapshot
+    }
+
+    private var serializedMessages: [[String: Any]] {
+        messages.map { message in
+            ["id": message.id, "role": message.role,
+             "content": message.content.keys.sorted().compactMap { message.content[$0].map(Self.webContent) }]
+        }
     }
 
     private static func webContent(_ content: Content) -> [String: Any] {
@@ -619,7 +623,7 @@ final class TerminalAIModel: ObservableObject {
         clearCommandEntry()
         cancelContextLoad()
         closeConnection()
-        finish()
+        finish(persist: false)
         guard saveConversation() else {
             error = historyError
             setPhase(.failed, "Could not save conversation")
@@ -698,7 +702,9 @@ final class TerminalAIModel: ObservableObject {
     private func scheduleHistorySave() {
         guard historyLease != nil, historySaveTask == nil else { return }
         historySaveTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
+            // Pi also persists its session; bound full transcript fsyncs while tokens stream.
+            // Submit, stop, settle, reset and application termination still save immediately.
+            try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled else { return }
             self?.historySaveTask = nil
             self?.saveConversation()
@@ -725,7 +731,7 @@ final class TerminalAIModel: ObservableObject {
         do {
             let data = try JSONEncoder().encode(TerminalAISavedWorkbench(attachments: attachments, task: taskPlan))
             let saved = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            try historyStore.save(.init(entry: entry, messages: webSnapshot["messages"] as? [[String: Any]] ?? [],
+            try historyStore.save(.init(entry: entry, messages: serializedMessages,
                                        phase: phase.rawValue, workbench: saved))
             history.removeAll { $0.id == entry.id }
             history.insert(entry, at: 0)
@@ -989,7 +995,7 @@ final class TerminalAIModel: ObservableObject {
         activeModelLabel = ""
     }
 
-    private func finish() {
+    private func finish(persist: Bool = true) {
         cancelExternalOperation(reason: "The task ended before the external result was confirmed.")
         cancelTerminalRequest(reason: "The agent task ended before the terminal result arrived.", interrupt: true)
         terminalControlAllowed = false
@@ -1034,7 +1040,7 @@ final class TerminalAIModel: ObservableObject {
                      wasStopping ? "Stopped" : (error == nil ? "Completed" : "Failed"))
         }
         if !isRunning { taskPlan?.finish(interrupted: wasStopping || error != nil) }
-        saveConversation()
+        if persist { saveConversation() }
     }
 
     private func fail(_ message: String) {

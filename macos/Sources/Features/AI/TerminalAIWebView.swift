@@ -37,7 +37,7 @@ struct TerminalAIWebView: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {
-        coordinator.pendingPush?.cancel()
+        coordinator.invalidate()
         coordinator.onAction = nil
         coordinator.onFailure = nil
         view.configuration.userContentController.removeScriptMessageHandler(forName: "ghosttyAI")
@@ -95,11 +95,16 @@ struct TerminalAIWebView: NSViewRepresentable {
             default: break
             }
         }
-        var snapshot = model.webSnapshot
-        snapshot["contextTitle"] = contextTitle
-        snapshot["appearance"] = colorScheme == .dark ? "dark" : "light"
-        snapshot["draftRevision"] = coordinator.draftRevision
-        coordinator.enqueue(snapshot)
+        let title = contextTitle
+        let appearance = colorScheme == .dark ? "dark" : "light"
+        coordinator.enqueue { [weak coordinator, weak model] in
+            guard let coordinator, let model, coordinator.conversationID == model.conversationID else { return [:] }
+            var snapshot = model.webSnapshot
+            snapshot["contextTitle"] = title
+            snapshot["appearance"] = appearance
+            snapshot["draftRevision"] = coordinator.draftRevision
+            return snapshot
+        }
     }
 
     @MainActor
@@ -110,7 +115,10 @@ struct TerminalAIWebView: NSViewRepresentable {
         var onFailure: ((String) -> Void)?
         var pendingPush: DispatchWorkItem?
         private var ready = false
-        private var snapshot: [String: Any] = [:]
+        private var snapshotProvider: (() -> [String: Any])?
+        private var needsPush = false
+        private var isPushing = false
+        private var generation = 0
         private(set) var draftRevision = 0
         let conversationID: UUID?
 
@@ -126,8 +134,27 @@ struct TerminalAIWebView: NSViewRepresentable {
         }
 
         func enqueue(_ snapshot: [String: Any]) {
-            self.snapshot = snapshot
-            guard ready, pendingPush == nil else { return }
+            enqueue { snapshot }
+        }
+
+        func enqueue(_ provider: @escaping () -> [String: Any]) {
+            snapshotProvider = provider
+            needsPush = true
+            schedulePush()
+        }
+
+        func invalidate() {
+            generation += 1
+            ready = false
+            pendingPush?.cancel()
+            pendingPush = nil
+            snapshotProvider = nil
+            needsPush = false
+            isPushing = false
+        }
+
+        private func schedulePush() {
+            guard ready, needsPush, !isPushing, pendingPush == nil else { return }
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.pendingPush = nil
@@ -139,15 +166,24 @@ struct TerminalAIWebView: NSViewRepresentable {
         }
 
         private func push() {
-            guard ready, let webView else { return }
+            guard ready, needsPush, !isPushing, let provider = snapshotProvider, let webView else { return }
+            needsPush = false
+            isPushing = true
+            let generation = generation
+            let snapshot = provider()
             webView.callAsyncJavaScript(
                 "window.ghosttyAI.update(snapshot)",
                 arguments: ["snapshot": snapshot],
                 in: nil,
                 in: .page) { [weak self] result in
+                    guard let self, self.generation == generation else { return }
+                    self.isPushing = false
                     if case .failure(let error) = result {
-                        self?.onFailure?("The AI view could not update: \(error.localizedDescription)")
+                        self.invalidate()
+                        self.onFailure?("The AI view could not update: \(error.localizedDescription)")
+                        return
                     }
+                    self.schedulePush()
                 }
         }
 
@@ -188,7 +224,7 @@ struct TerminalAIWebView: NSViewRepresentable {
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            ready = false
+            invalidate()
             onFailure?("The AI view stopped responding. Reload the conversation to reconnect to the running task.")
         }
     }

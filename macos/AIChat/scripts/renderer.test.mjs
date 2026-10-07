@@ -285,13 +285,20 @@ test("tool argument display stays stable across reordered snapshots without chan
   const actions = [];
   window.webkit = { messageHandlers: { ghosttyAI: { postMessage: (value) => actions.push(value) } } };
   window.eval(script);
-  const display = () => window.document.querySelector(".tool-body pre")?.textContent;
+  const display = () => window.document.querySelector(".tool-arguments pre")?.textContent;
   const update = (args, result) => window.ghosttyAI.update({ messages: [{ id: "arguments-message", role: "assistant", content: [{ type: "tool-call", toolCallId: "arguments-tool", toolName: "ghostty_terminal", args, result }] }], isRunning: false, phase: "completed", status: "Complete", prompt: "" });
   try {
     await until(() => actions.some((value) => value.type === "ready"));
     const first = { reason: "查看终端当前状态，确认 shell 就绪", operation: "read" };
     const firstBefore = JSON.stringify(first);
     update(first);
+    await until(() => window.document.querySelector(".tool-card"));
+    assert.equal(window.document.querySelector(".tool-label").textContent, "Read terminal", "Preparation uses a readable operation name");
+    window.document.querySelector(".tool-card > summary").click();
+    await until(() => window.document.querySelector(".tool-arguments"));
+    assert.equal(display(), undefined, "Raw parameters require their own explicit disclosure");
+    assert.equal(window.document.querySelector(".tool-reason").textContent, first.reason);
+    window.document.querySelector(".tool-arguments > summary").click();
     await until(() => display()?.includes('"operation": "read"'));
     const expected = '{\n  "operation": "read",\n  "reason": "查看终端当前状态，确认 shell 就绪"\n}';
     assert.equal(display(), expected);
@@ -364,9 +371,35 @@ test("file tools remain local beside SSH and file changes require one reviewed d
     await until(() => document.querySelectorAll(".tool-card").length === fileNames.length);
     for (const card of document.querySelectorAll(".tool-card")) {
       assert.equal(card.querySelector(".tool-target").textContent, "This Mac", "An SSH terminal must not change a file tool's target");
-      assert.equal(card.querySelector(".tool-detail").textContent, "/Users/fixture/project/config.txt");
+      assert.equal(card.querySelector(".tool-detail").textContent, "config.txt");
+      assert.equal(card.querySelector(".tool-detail").title, "/Users/fixture/project/config.txt");
       assert.equal(card.querySelector(".tool-state").textContent, "Preparing");
     }
+    const largeOutput = "CLOSED_TOOL_OUTPUT\n" + "configuration: enabled\n".repeat(1000);
+    const completed = structuredClone(snapshot.messages);
+    completed[0].content.forEach((part) => { part.result = { label: part.toolName, text: largeOutput, isRunning: false, isError: false }; });
+    update({ messages: completed });
+    await until(() => document.querySelector(".tool-state").textContent === "Done");
+    assert.equal(document.querySelectorAll(".tool-body").length, 0, "Completed tools keep their large output out of the DOM until opened");
+    assert.equal(document.querySelector(".transcript").textContent.includes("CLOSED_TOOL_OUTPUT"), false);
+    const readCard = document.querySelector('[data-tool-name="read"]');
+    readCard.querySelector("summary").click();
+    await until(() => readCard.querySelector(".tool-output"));
+    assert.equal(readCard.querySelector(".tool-output").textContent, largeOutput);
+    assert.equal(readCard.querySelector(".tool-command").textContent, "/Users/fixture/project/config.txt");
+    button("Copy output").click();
+    assert.equal(actions.filter((value) => value.type === "copy").at(-1).text, largeOutput, "A lazily opened result still copies its complete output");
+    update({ status: "Inspecting another file" });
+    await tick();
+    assert.equal(readCard.open, true, "Native updates preserve the user's disclosure choice");
+    readCard.querySelector("summary").click();
+    await until(() => !readCard.querySelector(".tool-body"));
+    const failed = structuredClone(completed);
+    failed[0].content[0].result.isError = true;
+    failed[0].content[0].result.text = "Permission denied";
+    update({ messages: failed });
+    await until(() => readCard.querySelector(".tool-state").textContent === "Failed");
+    assert.equal(readCard.classList.contains("tool-error"), true, "Failure stays visible even when its body is collapsed");
     const preview = "--- config.txt\n+++ config.txt\n@@ -1 +1 @@\n-old\n+<new value>";
     update({ approval: { id: "file-review-1", title: "Edit local file", message: "Review this change before applying it.", target: "This Mac", path: "/Users/fixture/project/config.txt", preview }, phase: "waiting_approval" });
     await until(() => document.querySelector(".approval-preview"));

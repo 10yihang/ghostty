@@ -5,6 +5,68 @@ import WebKit
 
 @MainActor
 struct TerminalAIWebViewTests {
+    @Test func snapshotFactoriesCoalesceBeforeReadinessAndReleaseCancelledWork() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let index = directory.appendingPathComponent("index.html")
+        try """
+        <script>
+        window.ghosttyAI = { update(snapshot) { window.sequence = snapshot.sequence; } };
+        window.webkit.messageHandlers.ghosttyAI.postMessage({ type: 'ready' });
+        </script>
+        """.write(to: index, atomically: true, encoding: .utf8)
+        let coordinator = TerminalAIWebView.Coordinator()
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.userContentController.add(coordinator, name: "ghosttyAI")
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 420, height: 600), configuration: configuration)
+        coordinator.webView = view
+        coordinator.documentURL = index
+        view.navigationDelegate = coordinator
+        defer {
+            coordinator.invalidate()
+            configuration.userContentController.removeScriptMessageHandler(forName: "ghosttyAI")
+            view.stopLoading()
+        }
+        var builds = 0
+        for sequence in 1...100 {
+            coordinator.enqueue {
+                builds += 1
+                return ["sequence": sequence]
+            }
+        }
+        #expect(builds == 0)
+        view.loadFileURL(index, allowingReadAccessTo: directory)
+        try await wait(view, for: "window.sequence === 100")
+        #expect(builds == 1)
+
+        var latest = 101
+        coordinator.enqueue {
+            builds += 1
+            return ["sequence": latest]
+        }
+        latest = 200
+        try await wait(view, for: "window.sequence === 200")
+        #expect(builds == 2)
+
+        weak var captured: NSObject?
+        do {
+            let owner = NSObject()
+            captured = owner
+            coordinator.enqueue { [owner] in
+                withExtendedLifetime(owner) { builds += 1 }
+                return ["sequence": 300]
+            }
+        }
+        #expect(captured != nil)
+        coordinator.invalidate()
+        #expect(captured == nil)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(builds == 2)
+        #expect(try await view.evaluateJavaScript("window.sequence") as? Int == 200)
+    }
+
     @Test func bridgeRejectsOlderDraftRevisions() {
         let coordinator = TerminalAIWebView.Coordinator()
         #expect(!coordinator.acceptDraftRevision(["revision": -1]))

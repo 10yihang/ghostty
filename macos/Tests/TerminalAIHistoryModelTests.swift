@@ -1,10 +1,132 @@
 import Foundation
+import Combine
 import GhosttyKit
 import Testing
 @testable import Ghostty
 
 @MainActor
 struct TerminalAIHistoryModelTests {
+    @Test func streamingCheckpointsAreSpacedOutAndSettlingImmediatelyPersistsTheLatestText() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.makeModel()
+        defer { _ = model.reset() }
+        model.prompt = "Synthetic streaming checkpoint"
+        model.submit()
+        let id = model.conversationID
+        for index in 0..<199 {
+            let value: [String: Any] = ["role": "assistant", "timestamp": index,
+                                       "content": [["type": "text", "text": String(repeating: "fixture text ", count: 128)]]]
+            model.receive(["type": "message_start", "message": value])
+            model.receive(["type": "message_end", "message": value])
+        }
+        model.receive(["type": "message_start", "message": ["role": "assistant", "timestamp": 1000]])
+        model.receive(["type": "message_update", "assistantMessageEvent": ["type": "text_start", "contentIndex": 0]])
+        var checkpoints: [(time: Double, bytes: Int)] = []
+        let start = ProcessInfo.processInfo.systemUptime
+        let observation = model.$history.dropFirst().sink { entries in
+            guard entries.contains(where: { $0.id == id }),
+                  let data = try? Data(contentsOf: fixture.transcript(id)) else { return }
+            checkpoints.append((ProcessInfo.processInfo.systemUptime, data.count))
+        }
+        defer { observation.cancel() }
+        var text = ""
+        while ProcessInfo.processInfo.systemUptime - start < 1.25 {
+            text += "latest 中文 "
+            model.receive(["type": "message_update", "assistantMessageEvent": [
+                "type": "text_delta", "contentIndex": 0, "delta": "latest 中文 "
+            ]])
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        // Measure successful native writes, not a test-only scheduler counter.
+        #expect(checkpoints.first.map { $0.time - start >= 0.85 } ?? true)
+        for (previous, next) in zip(checkpoints, checkpoints.dropFirst()) {
+            #expect(next.time - previous.time >= 0.85)
+        }
+        let streamingWrites = checkpoints.count
+        let streamingBytes = checkpoints.reduce(0) { $0 + $1.bytes }
+        if !checkpoints.isEmpty {
+            // A fresh reader recovers a durable interrupted checkpoint without
+            // inheriting the active owner's lease, process or authorization.
+            let recovered = fixture.makeModel()
+            #expect(recovered.openConversation(id))
+            #expect(recovered.phase == .stopped)
+            #expect(!recovered.isRunning)
+            #expect(!recovered.terminalControlAllowed)
+            #expect(recovered.approval == nil)
+            #expect(recovered.response.contains("latest 中文"))
+        }
+        model.receive(["type": "agent_settled"])
+        #expect(checkpoints.count == streamingWrites + 1)
+        let saved = try fixture.store.read(id: id)
+        #expect(saved.phase == "completed")
+        let content = try #require(saved.messages.last?["content"] as? [[String: Any]])
+        #expect(content.last?["text"] as? String == text)
+        #expect(saved.entry.messageCount == model.messages.count)
+        print("Native history stream: \(model.messages.count) messages, \(streamingWrites) checkpoints, \(streamingBytes) bytes; final save immediate")
+    }
+
+    @Test func resetWritesOneFinalTranscriptBeforeReleasingItsLease() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.makeModel()
+        model.prompt = "Keep this pending stream"
+        model.submit()
+        let id = model.conversationID
+        model.receive(["type": "message_start", "message": ["role": "assistant"]])
+        model.receive(["type": "message_update", "assistantMessageEvent": [
+            "type": "text_delta", "contentIndex": 0, "delta": "pending final 中文"
+        ]])
+        var writes = 0
+        var bytes = 0
+        let observation = model.$history.dropFirst().sink { entries in
+            guard entries.contains(where: { $0.id == id }),
+                  let data = try? Data(contentsOf: fixture.transcript(id)) else { return }
+            writes += 1
+            bytes += data.count
+        }
+        defer { observation.cancel() }
+        #expect(model.reset())
+        #expect(writes == 1)
+        #expect(model.conversationID != id)
+        #expect(model.messages.isEmpty)
+        let saved = try fixture.store.read(id: id)
+        let content = try #require(saved.messages.last?["content"] as? [[String: Any]])
+        #expect(content.last?["text"] as? String == "pending final 中文")
+        let lease = try fixture.store.acquire(id: id)
+        withExtendedLifetime(lease) { #expect(saved.entry.messageCount == 2) }
+        print("Native history reset: \(writes) write, \(bytes) bytes; transcript durable before lease release")
+    }
+
+    @Test func stoppingAndStartingANewConversationCannotLeaveAnOldCheckpointWriting() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.makeModel()
+        defer { _ = model.reset() }
+        model.prompt = "Old task"
+        model.submit()
+        let oldID = model.conversationID
+        model.receive(["type": "message_start", "message": ["role": "assistant"]])
+        model.receive(["type": "message_update", "assistantMessageEvent": [
+            "type": "text_delta", "contentIndex": 0, "delta": "partial old result"
+        ]])
+        model.stop()
+        model.receive(["type": "agent_settled"])
+        #expect(try fixture.store.read(id: oldID).phase == "stopped")
+        #expect(model.reset())
+        let stoppedData = try Data(contentsOf: fixture.transcript(oldID))
+        model.prompt = "New task"
+        model.submit()
+        let newID = model.conversationID
+        fixture.complete(model, text: "Final new result")
+        let newData = try Data(contentsOf: fixture.transcript(newID))
+        try await Task.sleep(for: .seconds(1.1))
+        #expect(try Data(contentsOf: fixture.transcript(oldID)) == stoppedData)
+        #expect(try Data(contentsOf: fixture.transcript(newID)) == newData)
+        #expect(try fixture.store.read(id: newID).phase == "completed")
+        #expect(oldID != newID)
+    }
+
     @Test func anotherModelLoadsHistoryWithoutSendingOrChangingTerminalBinding() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -187,6 +309,10 @@ struct TerminalAIHistoryModelTests {
         let suite = "TerminalAIHistoryModelTests.\(UUID())"
         var commands: [[String: Any]] = []
         var store: TerminalAIHistoryStore { .init(directory: directory.appendingPathComponent("conversations")) }
+
+        func transcript(_ id: UUID) -> URL {
+            store.sessionURL(id: id).deletingLastPathComponent().appendingPathComponent("conversation.json")
+        }
 
         init() throws {
             directory = FileManager.default.temporaryDirectory.appendingPathComponent("TerminalAIHistoryModelTests.\(UUID())")

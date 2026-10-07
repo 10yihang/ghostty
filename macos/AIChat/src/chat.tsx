@@ -137,28 +137,46 @@ function formatToolArguments(args: unknown) {
     ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]])) : value, 2);
 }
 
+const toolLabels: Record<string, string> = {
+  ghostty_propose_command: "Prepare command", ghostty_mcp: "Use MCP tools",
+  ghostty_task_plan: "Update investigation", ghostty_context: "Read attached context",
+  read: "Read file", ls: "List files", find: "Find files", grep: "Search files",
+  edit: "Edit file", write: "Write file",
+};
+function ToolArguments({ args }: { args: ToolCallMessagePartProps["args"] }) {
+  const [expanded, setExpanded] = useState(false);
+  return <details className="tool-arguments" onToggle={(event) => setExpanded(event.currentTarget.open)}>
+    <summary><Icon name="chevron" className="disclosure-icon" />Request details</summary>
+    {expanded && <pre>{formatToolArguments(args)}</pre>}
+  </details>;
+}
+
 function ToolCard({ toolName, args, result, isError }: ToolCallMessagePartProps) {
+  const [expanded, setExpanded] = useState(false);
   const output = result as ToolResult | undefined;
   const running = output?.isRunning === true;
   const failed = isError || output?.isError;
   const detail = output?.detail || (typeof args?.command === "string" ? args.command : typeof args?.path === "string" ? args.path : "");
-  const label = output?.label || toolName;
+  const label = output?.label || (toolName === "ghostty_terminal" ? args?.operation === "read" ? "Read terminal" : "Run in terminal" : toolLabels[toolName] || toolName);
   const localFile = ["read", "ls", "find", "grep", "edit", "write"].includes(toolName);
-  return <details className={`tool-card ${failed ? "tool-error" : ""}`} data-tool-name={toolName}>
+  const target = localFile && detail ? detail.replace(/\/$/, "").split("/").pop() || detail : detail;
+  const reason = typeof args?.reason === "string" ? args.reason : "";
+  return <details className={`tool-card ${failed ? "tool-error" : ""}`} data-tool-name={toolName} onToggle={(event) => setExpanded(event.currentTarget.open)}>
     <summary>
       {running ? <span className="activity-dot" /> : failed ? <Icon name="alert" /> : !output ? <span className="status-dot" /> : <Icon name="check" />}
-      <span className="tool-label">{label}</span>
+      <span className="tool-label" title={label}>{label}</span>
       {localFile && <span className="tool-target" title="File tools operate on this Mac, including when the attached terminal is using SSH.">This Mac</span>}
-      <span className="tool-detail" title={detail}>{detail}</span>
+      <span className="tool-detail" title={detail}>{target}</span>
       <span className="tool-state">{running ? "Running" : failed ? "Failed" : !output ? "Preparing" : "Done"}</span>
       <Icon name="chevron" className="disclosure-icon" />
     </summary>
-    <div className="tool-body">
+    {expanded && <div className="tool-body">
+      {reason && <p className="tool-reason">{reason}</p>}
       {detail && <pre className="tool-command">{detail}</pre>}
-      {!detail && Object.keys(args || {}).length > 0 && <pre>{formatToolArguments(args)}</pre>}
       {output?.text ? <pre className="tool-output">{output.text}</pre> : <p className="muted">{!output ? "Waiting for execution…" : running ? "Waiting for output…" : "No output."}</p>}
       {output?.text && <CopyButton text={output.text} label="Copy output" />}
-    </div>
+      {Object.keys(args || {}).length > 0 && <ToolArguments args={args} />}
+    </div>}
   </details>;
 }
 const userParts = { Text: UserText };
@@ -186,7 +204,7 @@ function RunStatus({ snapshot }: { snapshot: Snapshot }) {
   const label = snapshot.status || (snapshot.isRunning ? "Agent is running" : "Ready");
   return <div className={`run-bar ${snapshot.isRunning ? "active" : ""} ${failed ? "failed" : ""}`} data-phase={snapshot.phase}>
     <span className={snapshot.isRunning && !waiting ? "activity-dot" : "status-dot"} />
-    <span className="run-label" role="status" aria-live="polite" aria-atomic="true">{label}</span>
+    <span className="run-label" title={label} role="status" aria-live="polite" aria-atomic="true">{label}</span>
     {snapshot.isRunning && snapshot.startedAt && <span className="elapsed" aria-label={`Elapsed ${elapsed}`}>{elapsed}</span>}
     {snapshot.isRunning && <button className="stop-button" type="button" disabled={snapshot.phase === "stopping"} onClick={() => action({ type: "stop" })}><Icon name="stop" />{snapshot.phase === "stopping" ? "Stopping…" : "Stop"}</button>}
   </div>;
@@ -449,7 +467,7 @@ function Chat() {
           {snapshot.terminalControlAllowed && <Icon name="check" />}<span>Auto-approve queries{snapshot.terminalControlAllowed ? " on" : ""}</span>
         </button>
         {snapshot.context && <details className="context-preview"><summary><Icon name="chevron" /><span>{snapshot.contextTitle || "Terminal context"}</span><span className="muted">{snapshot.context.split("\n").length} lines</span><span className="context-hint">Preview</span><button type="button" className="quiet-button" aria-label="Remove attached context" disabled={snapshot.isRunning || snapshot.contextLoading} title={snapshot.isRunning ? "Context attached to current task; stop before removing" : "Remove attached context"} onClick={(event) => { event.preventDefault(); event.stopPropagation(); if (!currentSnapshot.isRunning && !currentSnapshot.contextLoading) action({ type: "remove_context" }); }}>Remove</button></summary><pre>{snapshot.context}</pre></details>}
-        {snapshot.isRunning ? <label className="run-mode">While running <select aria-label="Message behavior while running" value={runMode} onChange={(event) => setRunMode(event.target.value as "follow_up" | "steer")}><option value="follow_up">Queue follow-up</option><option value="steer">Steer current task</option></select></label> : <span className="keyboard-hints">Enter to send · Shift+Enter for a new line · Esc to hide</span>}
+        {snapshot.isRunning ? <label className="run-mode"><span className="visually-hidden">While running</span><select aria-label="Message behavior while running" value={runMode} onChange={(event) => setRunMode(event.target.value as "follow_up" | "steer")}><option value="follow_up">Queue follow-up</option><option value="steer">Steer current task</option></select></label> : <span className="keyboard-hints">Enter to send · Shift+Enter for a new line · Esc to hide</span>}
       </div>
       <div className="composer-row"><details ref={attachMenu} className="attach-menu"><summary aria-label="Add project context" aria-disabled={snapshot.isRunning || snapshot.contextLoading} onClick={(event) => { if (snapshot.isRunning || snapshot.contextLoading) event.preventDefault(); }} title="Attach a file, log, Git diff, or project instructions"><Icon name="attach" /></summary><div className="attach-menu-content"><strong>Add context</strong>{[{ kind: "file", label: "File…" }, { kind: "log", label: "Log excerpt…" }, { kind: "git_diff", label: "Git diff" }, { kind: "project", label: "Project instructions" }].map((item) => <button key={item.kind} type="button" disabled={snapshot.isRunning || snapshot.contextLoading} onClick={(event) => { if (!currentSnapshot.isRunning && !currentSnapshot.contextLoading) action({ type: "attach_context", kind: item.kind }); event.currentTarget.closest("details")?.removeAttribute("open"); composer.current?.focus(); }}>{item.label}</button>)}</div></details><textarea ref={composer} aria-label="Message AI" placeholder={snapshot.isRunning ? "Add a follow-up, or steer this task…" : "Ask AI… · @ to attach context"} value={prompt} onChange={(event) => { const text = event.target.value; const revision = ++localRevision.current; setPrompt(text); action({ type: "draft", text, revision }); }} onCompositionStart={() => { composing.current = true; deferredPrompt.current = null; }} onCompositionEnd={() => {
         composing.current = false;
