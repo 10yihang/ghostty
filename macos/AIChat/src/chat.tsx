@@ -196,11 +196,15 @@ function Approval({ value }: { value: NonNullable<Snapshot["approval"]> }) {
     setAnswered(true);
     action({ type: "approval", id: value.id, allow });
   };
-  return <section className="approval" aria-label="Action needs approval">
-    <div className="approval-title"><Icon name="alert" /><strong>{value.title || "Approve this action"}</strong></div>
+  const fileReview = value.preview !== undefined;
+  const body = <>
     {(value.target || value.path) && <p className="approval-target"><span>{value.target || "This Mac"}</span>{value.path && <code>{value.path}</code>}</p>}
     <pre>{value.message}</pre>
     {value.preview !== undefined && <pre className="approval-preview" aria-label="File change preview">{value.preview}</pre>}
+  </>;
+  return <section className={`approval${fileReview ? " file-approval" : ""}`} aria-label="Action needs approval">
+    <div className="approval-title"><Icon name="alert" /><strong>{value.title || "Approve this action"}</strong></div>
+    {fileReview ? <div className="file-approval-body">{body}</div> : body}
     <div className="approval-actions"><span className="muted">{answered ? "Sending decision…" : "Agent is waiting for your decision."}</span>
       <button type="button" disabled={answered} onClick={() => decide(false)}>Decline</button>
       <button className="primary" type="button" disabled={answered} onClick={() => decide(true)}>Allow this action</button>
@@ -406,7 +410,7 @@ function Chat() {
     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(prompt); }
     else if (event.key === "Enter" && event.shiftKey && (event.metaKey || event.ctrlKey)) { event.preventDefault(); send(prompt, true); }
   };
-  return <AssistantRuntimeProvider runtime={runtime}><ThreadPrimitive.Root className="chat">
+  return <AssistantRuntimeProvider runtime={runtime}><ThreadPrimitive.Root className={`chat${snapshot.approval?.preview !== undefined ? " has-file-approval" : ""}`}>
     <Workbench snapshot={snapshot} />
     <div className="transcript-wrap">
       <div className="transcript" role="region" aria-label="Conversation messages" ref={viewport} onScroll={() => {

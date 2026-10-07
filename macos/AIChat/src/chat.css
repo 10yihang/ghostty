@@ -84,6 +84,10 @@ details[open] > summary .disclosure-icon,details[open] > summary > .icon:first-c
 .approval-target { display:flex; flex-wrap:wrap; gap:2px 8px; margin:6px 0; color:var(--muted); font-size:11px; }
 .approval-target code { overflow-wrap:anywhere; font-size:11px; }
 .approval .approval-preview { max-height:200px; padding:7px 9px; border:1px solid var(--border); border-radius:4px; background:var(--code); white-space:pre; overflow-wrap:normal; }
+.file-approval { display:flex; flex-direction:column; min-height:0; overflow:hidden; }
+.file-approval .approval-title,.file-approval .approval-actions { flex:none; }
+.file-approval-body { min-height:0; overflow:auto; margin:6px 0 8px; }
+.file-approval .approval-preview { max-height:none; overflow:visible; }
 .approval-actions { display:flex; align-items:center; justify-content:flex-end; gap:7px; font-size:11px; }
 .approval-actions .muted { margin-right:auto; }
 .error-message,.configuration-issue { display:flex; align-items:center; gap:8px; padding:7px 14px; font-size:12px; border-top:1px solid var(--border); flex-shrink:0; }
@@ -122,6 +126,10 @@ details[open] > summary .disclosure-icon,details[open] > summary > .icon:first-c
 .terminal-readiness > span { min-width:0; }
 .terminal-readiness button { flex-shrink:0; background:transparent; font-size:11px; min-height:24px; padding:2px 6px; }
 .workbench-browser { border-top:1px solid var(--border); max-height:min(260px,35vh); overflow:auto; }
+.has-file-approval .workbench { display:flex; flex-direction:column; flex:0 1 auto; min-height:35px; overflow:hidden; }
+.has-file-approval .workbench-toolbar { flex:none; }
+.has-file-approval .workbench-browser { min-height:0; flex:0 1 auto; }
+.has-file-approval .transcript-wrap { overflow:hidden; }
 .browser-filter { position:sticky; top:0; z-index:1; display:flex; align-items:center; gap:8px; padding:7px 12px; background:var(--bg); border-bottom:1px solid var(--border); }
 .browser-filter input[type=search] { width:100%; flex:1; font-size:12px; }
 .browser-filter label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:11px; }

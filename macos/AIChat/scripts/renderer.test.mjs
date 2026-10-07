@@ -326,6 +326,10 @@ test("file tools remain local beside SSH and file changes require one reviewed d
     const preview = "--- config.txt\n+++ config.txt\n@@ -1 +1 @@\n-old\n+<new value>";
     update({ approval: { id: "file-review-1", title: "Edit local file", message: "Review this change before applying it.", target: "This Mac", path: "/Users/fixture/project/config.txt", preview }, phase: "waiting_approval" });
     await until(() => document.querySelector(".approval-preview"));
+    assert.equal(document.querySelector(".approval").classList.contains("file-approval"), true);
+    assert.equal(document.querySelector(".file-approval-body").contains(document.querySelector(".approval-target")), true);
+    assert.equal(document.querySelector(".file-approval-body").contains(document.querySelector(".approval-preview")), true);
+    assert.equal(document.querySelector(".file-approval-body").contains(button("Allow this action")), false, "Review actions stay outside the scrolling content");
     assert.equal(document.querySelector('[aria-label="File change preview"]').textContent, preview);
     assert.equal(document.querySelector(".approval-preview").children.length, 0, "Diff text is displayed without executing markup");
     assert.match(document.querySelector(".approval-target").textContent, /This Mac\/Users\/fixture\/project\/config.txt/);
