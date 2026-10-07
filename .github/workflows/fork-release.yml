@@ -147,10 +147,49 @@ jobs:
       - name: Build Debug framework and test the native app
         run: |
           zig build -Doptimize=Debug -Demit-macos-app=false -Dxcframework-target=native
+          native_exit=0
           env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
             xcodebuild -project macos/Ghostty.xcodeproj -scheme Ghostty \
             -configuration Debug -arch arm64 -skip-testing GhosttyUITests \
-            SYMROOT="$GITHUB_WORKSPACE/macos/build" test
+            -resultBundlePath "$RUNNER_TEMP/fork-native.xcresult" \
+            SYMROOT="$GITHUB_WORKSPACE/macos/build" test || native_exit=$?
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/fork-native.xcresult" --compact \
+            > "$RUNNER_TEMP/fork-native-summary.json" || true
+          python3 - <<'PY' || true
+          import json, os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP']) / 'fork-native-summary.json'
+          try:
+              summary = json.loads(path.read_text())
+          except (OSError, ValueError):
+              print('Native result summary unavailable; inspect the uploaded xcresult bundle.')
+          else:
+              bounded = {}
+              for key, value in summary.items():
+                  if key == 'testFailures':
+                      bounded[key] = [json.dumps(failure, ensure_ascii=False)[:1000] for failure in value[:50]]
+                      if len(value) > 50:
+                          bounded['additionalFailures'] = len(value) - 50
+                  elif isinstance(value, (dict, list)):
+                      bounded[key] = json.dumps(value, ensure_ascii=False)[:2000]
+                  elif isinstance(value, str):
+                      bounded[key] = value[:1000]
+                  else:
+                      bounded[key] = value
+              print(json.dumps(bounded, indent=2, ensure_ascii=False))
+          PY
+          exit "$native_exit"
+      - name: Preserve native failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-native-test-results
+          path: |
+            ${{ runner.temp }}/fork-native.xcresult
+            ${{ runner.temp }}/fork-native-summary.json
+          retention-days: 7
+          if-no-files-found: warn
       - name: Build ReleaseFast app and prepare a fork-only archive
         run: |
           zig build -Doptimize=ReleaseFast -Dxcframework-target=native
