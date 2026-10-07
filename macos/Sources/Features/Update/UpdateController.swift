@@ -22,8 +22,7 @@ class UpdateController {
     }
 
     /// Initialize a new update controller.
-    init() {
-        let hostBundle = Bundle.main
+    init(hostBundle: Bundle = .main) {
         self.userDriver = UpdateDriver(
             viewModel: .init(),
             hostBundle: hostBundle)
@@ -41,6 +40,7 @@ class UpdateController {
     /// the error will be shown to the user.
     func startUpdater() {
         do {
+            _ = try UpdateConfiguration(bundle: updater.hostBundle)
             try updater.start()
         } catch {
             userDriver.viewModel.state = .error(.init(
@@ -60,6 +60,16 @@ class UpdateController {
     ///
     /// This is typically connected to a menu item action.
     func checkForUpdates() {
+        do {
+            _ = try UpdateConfiguration(bundle: updater.hostBundle)
+        } catch {
+            userDriver.viewModel.state = .error(.init(
+                error: error,
+                retry: { [weak self] in self?.checkForUpdates() },
+                dismiss: { [weak self] in self?.userDriver.viewModel.state = .idle }
+            ))
+            return
+        }
         // If we're already idle, then just check for updates immediately.
         if viewModel.state == .idle {
             updater.checkForUpdates()

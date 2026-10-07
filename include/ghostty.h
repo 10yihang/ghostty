@@ -920,6 +920,8 @@ typedef struct {
   int16_t exit_code;
   // number of nanoseconds that command was running for
   uint64_t duration;
+  // exact command-history record captured at OSC D; 0 if uncorrelated
+  uint64_t record_sequence;
 } ghostty_action_command_finished_s;
 
 // apprt.action.StartSearch.C
@@ -1016,6 +1018,8 @@ typedef enum {
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
   GHOSTTY_ACTION_RESIZE_WINDOW,
+  GHOSTTY_ACTION_TOGGLE_AI_PANEL,
+  GHOSTTY_ACTION_AI_COMMAND_ENTRY,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1234,6 +1238,42 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(
 GHOSTTY_API void ghostty_surface_deny_clipboard_request(ghostty_surface_t,
                                                            void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
+typedef struct {
+  uint64_t started;
+  uint64_t finished;
+  int32_t exit_code; // -1 when not supplied by shell integration
+} ghostty_surface_command_state_s;
+// Synchronous OSC 133 C/D counters, independent of app notification delivery.
+GHOSTTY_API ghostty_surface_command_state_s ghostty_surface_command_state(
+    ghostty_surface_t);
+typedef enum {
+  GHOSTTY_PROMPT_READY,
+  GHOSTTY_PROMPT_NO_SHELL_INTEGRATION,
+  GHOSTTY_PROMPT_ALTERNATE_SCREEN,
+  GHOSTTY_PROMPT_COMMAND_RUNNING,
+  GHOSTTY_PROMPT_NOT_READY,
+  GHOSTTY_PROMPT_SECONDARY,
+  GHOSTTY_PROMPT_BOUNDARY_MISSING,
+  GHOSTTY_PROMPT_STALE,
+  GHOSTTY_PROMPT_INPUT_NOT_EMPTY,
+  GHOSTTY_PROMPT_UNMARKED_TEXT,
+  GHOSTTY_PROMPT_MAX_VALUE = 0x7fffffff,
+} ghostty_prompt_status_e;
+GHOSTTY_API ghostty_prompt_status_e ghostty_surface_prompt_status(ghostty_surface_t);
+// Requires OSC 133 shell integration, the primary screen, and visibly empty
+// input at the current prompt. Text after the cursor is included in the check.
+GHOSTTY_API bool ghostty_surface_prompt_state(ghostty_surface_t);
+// Reads semantic output from the running or most recently completed command.
+// Returns false when no command output is available. Free with free_text.
+GHOSTTY_API bool ghostty_surface_read_command_output(ghostty_surface_t,
+                                                        ghostty_text_s*);
+// JSON snapshots of bounded command records and the reported OSC 7 shell
+// identity. Remote directories remain distinct from trusted local pwd.
+// Both snapshots are UTF-8 text owned by the caller; free with free_text.
+GHOSTTY_API bool ghostty_surface_read_command_history(ghostty_surface_t,
+                                                         ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_terminal_identity(ghostty_surface_t,
+                                                          ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,

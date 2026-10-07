@@ -601,6 +601,12 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Reload the config file."),
         }},
 
+        .ai_command_entry => comptime &.{.{
+            .action = .ai_command_entry,
+            .title = i18n.N_("Write Command with AI"),
+            .description = i18n.N_("Describe a task, review the generated command, and send it to the current terminal."),
+        }},
+
         .close_surface => comptime &.{.{
             .action = .close_surface,
             .title = i18n.N_("Close Terminal"),
@@ -740,6 +746,7 @@ fn actionCommands(action: Action.Key) []const Command {
         // No commands because I'm not sure they make sense in a command
         // palette context.
         .toggle_command_palette,
+        .toggle_ai_panel,
         .toggle_quick_terminal,
         .toggle_visibility,
         .previous_tab,

@@ -812,6 +812,16 @@ pub const Action = union(enum) {
     /// version can be found by running `ghostty +version`.
     toggle_command_palette,
 
+    /// Show or hide the AI panel for the active terminal. Showing the panel
+    /// focuses its composer and preserves the current conversation and draft.
+    ///
+    /// Only implemented on macOS.
+    toggle_ai_panel,
+
+    /// Open a compact natural-language command composer for the current
+    /// terminal, with an editable command preview. Only implemented on macOS.
+    ai_command_entry,
+
     /// Toggle the quick terminal.
     ///
     /// The quick terminal, also known as the "Quake-style" or drop-down
@@ -1428,6 +1438,8 @@ pub const Action = union(enum) {
             .toggle_secure_input,
             .toggle_mouse_reporting,
             .toggle_command_palette,
+            .toggle_ai_panel,
+            .ai_command_entry,
             .toggle_background_opacity,
             .show_on_screen_keyboard,
             .reset_window_size,

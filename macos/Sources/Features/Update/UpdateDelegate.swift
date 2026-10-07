@@ -3,17 +3,16 @@ import Cocoa
 
 extension UpdateDriver: SPUUpdaterDelegate {
     func feedURLString(for updater: SPUUpdater) -> String? {
-        guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else {
-            return nil
-        }
+        // Use this bundle's configured feed, including for manual menu checks.
+        // Config channels and old Sparkle defaults must not switch a fork to upstream.
+        // Sparkle treats nil as permission to fall back to old defaults/Info.plist.
+        // An empty override is invalid and cannot select a different feed.
+        (try? UpdateConfiguration(bundle: updater.hostBundle).feedURL.absoluteString) ?? ""
+    }
 
-        // Sparkle supports a native concept of "channels" but it requires that
-        // you share a single appcast file. We don't want to do that so we
-        // do this instead.
-        switch appDelegate.ghostty.config.autoUpdateChannel {
-        case .tip: return "https://tip.files.ghostty.org/appcast.xml"
-        case .stable: return "https://release.files.ghostty.org/appcast.xml"
-        }
+    func updater(_ updater: SPUUpdater, mayPerform updateCheck: SPUUpdateCheck) throws {
+        // Covers direct/background Sparkle checks as well as the controller entry points.
+        _ = try UpdateConfiguration(bundle: updater.hostBundle)
     }
 
     /// Called when an update is scheduled to install silently,

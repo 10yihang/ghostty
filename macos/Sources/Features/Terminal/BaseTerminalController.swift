@@ -1445,6 +1445,16 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    @IBAction func toggleAIPanel(_ sender: Any?) {
+        guard let surfaceView = focusedSurface else { return }
+        performAction("toggle_ai_panel", on: surfaceView)
+    }
+
+    @IBAction func aiCommandEntry(_ sender: Any?) {
+        guard let surfaceView = focusedSurface else { return }
+        performAction("ai_command_entry", on: surfaceView)
+    }
+
     @IBAction func find(_ sender: Any) {
         focusedSurface?.find(sender)
     }
@@ -1501,6 +1511,9 @@ extension BaseTerminalController: NSMenuItemValidation {
         switch item.action {
         case #selector(findHide):
             return focusedSurface?.searchState != nil
+
+        case #selector(toggleAIPanel), #selector(aiCommandEntry):
+            return focusedSurface?.surface != nil
 
         default:
             return true

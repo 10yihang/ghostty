@@ -93,9 +93,61 @@ _entrypoint() {
 _ghostty_deferred_init() {
     builtin emulate -L zsh -o no_warn_create_global -o no_aliases
 
+    # Powerlevel10k rebuilds PS1 after precmd and during asynchronous redraws,
+    # so marks injected into PS1 do not survive. Use its supported integration
+    # option instead. It must also own C/D to avoid counting each command twice.
+    # Respect an explicitly configured option; this changes only this shell.
+    builtin typeset -gi _ghostty_p10k_owns_semantic_marks=0
+    if (( $+functions[p10k] && $+functions[_p9k_precmd] )); then
+        if [[ -z ${POWERLEVEL9K_TERM_SHELL_INTEGRATION+x} ]]; then
+            builtin typeset -g POWERLEVEL9K_TERM_SHELL_INTEGRATION=true
+            p10k reload
+        fi
+        if [[ $POWERLEVEL9K_TERM_SHELL_INTEGRATION == true ]]; then
+            (( _ghostty_p10k_owns_semantic_marks = 1 ))
+            # ponytail: P10k exposes no hook for every asynchronous RPROMPT
+            # generation. This guarded seam is tested with its installed
+            # generator; future missing/renamed generators safely fail the
+            # terminal input guard instead of guessing that text is decoration.
+            if (( $+functions[_p9k_set_prompt] && ! $+functions[_ghostty_orig_p9k_set_prompt] )); then
+                functions[_ghostty_orig_p9k_set_prompt]=$functions[_p9k_set_prompt]
+                _p9k_set_prompt() {
+                    _ghostty_orig_p9k_set_prompt "$@"
+                    builtin local -i ghostty_p10k_status=$?
+                    _ghostty_mark_rprompt
+                    builtin return $ghostty_p10k_status
+                }
+            fi
+        fi
+    fi
+
+    _ghostty_mark_rprompt() {
+        builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+        if [[ -n ${_ghostty_saved_rprompt+x} && $RPROMPT == $_ghostty_marked_rprompt ]]; then
+            RPROMPT=$_ghostty_saved_rprompt
+        fi
+        _ghostty_saved_rprompt=$RPROMPT
+        # ZLE paints RPROMPT after B, so without its own mark it looks like
+        # pending input to the terminal. Preserve marks already in the theme.
+        if [[ -n $RPROMPT && $RPROMPT != *$'\e]133;P;k=r'* ]]; then
+            builtin local markR=$'%{\e]133;P;k=r\a%}'
+            builtin local markB=$'%{\e]133;B\a%}'
+            [[ $RPROMPT == *[^%]% || $RPROMPT == % ]] && RPROMPT=$RPROMPT%
+            RPROMPT=${markR}${RPROMPT}${markB}
+        fi
+        _ghostty_marked_rprompt=$RPROMPT
+    }
+
     # Enable semantic markup with OSC 133.
     _ghostty_precmd() {
         builtin local -i cmd_status=$?
+        if (( ! _ghostty_p10k_owns_semantic_marks )); then
+            _ghostty_precmd_mark $cmd_status
+        fi
+    }
+
+    _ghostty_precmd_mark() {
+        builtin local -i cmd_status=$1
         builtin emulate -L zsh -o no_warn_create_global -o no_aliases
 
         # Don't write OSC 133 D when our precmd handler is invoked from zle.
@@ -178,6 +230,8 @@ _ghostty_deferred_init() {
                 [[ $PS2 == *[^%]% || $PS2 == % ]] && PS2=$PS2%
                 PS2=${mark2}${PS2}${markB}
 
+                _ghostty_mark_rprompt
+
                 # Save the marked PS1 so we can detect modifications
                 # by other hooks in the next cycle.
                 _ghostty_marked_ps1=$PS1
@@ -220,14 +274,19 @@ _ghostty_deferred_init() {
             PS1=$_ghostty_saved_ps1
             PS2=$_ghostty_saved_ps2
         fi
+        if [[ -n ${_ghostty_saved_rprompt+x} && $RPROMPT == $_ghostty_marked_rprompt ]]; then
+            RPROMPT=$_ghostty_saved_rprompt
+        fi
 
         # This will work incorrectly in the presence of a preexec hook that
         # prints. For example, if MichaelAquilina/zsh-you-should-use installs
         # its preexec hook before us, we'll incorrectly mark its output as
         # belonging to the command (as if the user typed it into zle) rather
         # than command output.
-        builtin print -nu $_ghostty_fd '\e]133;C\a'
-        (( _ghostty_state = 1 ))
+        if (( ! _ghostty_p10k_owns_semantic_marks )); then
+            builtin print -nu $_ghostty_fd '\e]133;C\a'
+            (( _ghostty_state = 1 ))
+        fi
     }
 
     # Enable reporting current working dir to terminal. Ghostty supports
@@ -274,7 +333,7 @@ _ghostty_deferred_init() {
     # emit 133;B to mark the input area, which is needed for click-to-move.
     (( $+functions[_ghostty_zle_line_init] )) || _ghostty_zle_line_init() { builtin true; }
     functions[_ghostty_zle_line_init]="
-        if [[ \$PS1 != *$'%{\\e]133;A'* ]]; then
+        if (( ! _ghostty_p10k_owns_semantic_marks )) && [[ \$PS1 != *$'%{\\e]133;A'* ]]; then
             builtin print -nu \$_ghostty_fd '\\e]133;P;k=i\\a\\e]133;B\\a'
         fi
     "${functions[_ghostty_zle_line_init]}

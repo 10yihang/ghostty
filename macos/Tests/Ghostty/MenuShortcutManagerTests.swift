@@ -4,6 +4,28 @@ import Testing
 @testable import Ghostty
 
 struct MenuShortcutManagerTests {
+    @MainActor @Test func aiPanelShortcutTracksConfigReloadAndUnbind() throws {
+        let config = try TemporaryConfig("")
+        let item = NSMenuItem(title: "AI Panel", action: #selector(BaseTerminalController.toggleAIPanel(_:)), keyEquivalent: "")
+        let manager = Ghostty.MenuShortcutManager()
+
+        manager.syncMenuShortcut(config, action: "toggle_ai_panel", menuItem: item)
+        #expect(item.keyEquivalent == "a")
+        #expect(item.keyEquivalentModifierMask == [.command, .shift])
+
+        try config.reload("keybind = super+shift+a=unbind\nkeybind = super+shift+i=toggle_ai_panel")
+        manager.reset()
+        manager.syncMenuShortcut(config, action: "toggle_ai_panel", menuItem: item)
+        #expect(item.keyEquivalent == "i")
+        #expect(item.keyEquivalentModifierMask == [.command, .shift])
+
+        try config.reload("keybind = super+shift+a=unbind")
+        manager.reset()
+        manager.syncMenuShortcut(config, action: "toggle_ai_panel", menuItem: item)
+        #expect(item.keyEquivalent.isEmpty)
+        #expect(item.keyEquivalentModifierMask.isEmpty)
+    }
+
     @Test(.bug("https://github.com/ghostty-org/ghostty/issues/779", id: 779))
     func unbindShouldDiscardDefault() async throws {
         let config = try TemporaryConfig("keybind = super+d=unbind")

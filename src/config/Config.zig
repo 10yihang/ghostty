@@ -7127,6 +7127,16 @@ pub const Keybinds = struct {
         if (comptime builtin.target.os.tag.isDarwin()) {
             try self.set.put(
                 alloc,
+                .{ .key = .{ .unicode = 'a' }, .mods = .{ .super = true, .shift = true } },
+                .toggle_ai_panel,
+            );
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = 'k' }, .mods = .{ .super = true, .shift = true } },
+                .ai_command_entry,
+            );
+            try self.set.put(
+                alloc,
                 .{ .key = .{ .unicode = 'q' }, .mods = .{ .super = true } },
                 .{ .quit = {} },
             );
@@ -7682,6 +7692,63 @@ pub const Keybinds = struct {
         var set: Keybinds = .{};
         try set.parseCLI(alloc, "shift+a=copy_to_clipboard");
         try set.parseCLI(alloc, "shift+a=csi:hello");
+    }
+
+    test "AI panel shortcut defaults and rebinding" {
+        const testing = std.testing;
+        if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var keybinds: Keybinds = .{};
+        try keybinds.init(alloc);
+        const default_trigger = inputpkg.Binding.Trigger{
+            .key = .{ .unicode = 'a' },
+            .mods = .{ .super = true, .shift = true },
+        };
+        try testing.expectEqual(default_trigger, keybinds.set.getTrigger(.toggle_ai_panel).?);
+        const action: inputpkg.Binding.Action = .toggle_ai_panel;
+        try testing.expectEqual(inputpkg.Binding.Action.Scope.surface, action.scope());
+        // The AI shortcut must leave standard text selection available.
+        try testing.expectEqual(inputpkg.Binding.Trigger{
+            .key = .{ .unicode = 'a' },
+            .mods = .{ .super = true },
+        }, keybinds.set.getTrigger(.select_all).?);
+
+        try keybinds.parseCLI(alloc, "super+shift+a=unbind");
+        try testing.expect(keybinds.set.getTrigger(.toggle_ai_panel) == null);
+        try keybinds.parseCLI(alloc, "super+shift+i=toggle_ai_panel");
+        try testing.expectEqual(inputpkg.Binding.Trigger{
+            .key = .{ .unicode = 'i' },
+            .mods = .{ .super = true, .shift = true },
+        }, keybinds.set.getTrigger(.toggle_ai_panel).?);
+        try keybinds.parseCLI(alloc, "super+shift+i=unbind");
+        try testing.expect(keybinds.set.getTrigger(.toggle_ai_panel) == null);
+    }
+
+    test "AI command entry shortcut defaults and rebinding" {
+        if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+        var arena = ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var keybinds: Keybinds = .{};
+        try keybinds.init(alloc);
+        try std.testing.expectEqual(inputpkg.Binding.Trigger{
+            .key = .{ .unicode = 'k' },
+            .mods = .{ .super = true, .shift = true },
+        }, keybinds.set.getTrigger(.ai_command_entry).?);
+        const default_binding = keybinds.set.get(keybinds.set.getTrigger(.ai_command_entry).?).?;
+        try std.testing.expectEqual(inputpkg.Binding.Action.ai_command_entry, default_binding.value_ptr.leaf.action);
+        const action: inputpkg.Binding.Action = .ai_command_entry;
+        try std.testing.expectEqual(inputpkg.Binding.Action.Scope.surface, action.scope());
+        try keybinds.parseCLI(alloc, "super+shift+k=unbind");
+        try std.testing.expect(keybinds.set.getTrigger(.ai_command_entry) == null);
+        try keybinds.parseCLI(alloc, "super+shift+j=ai_command_entry");
+        try std.testing.expectEqual(inputpkg.Binding.Trigger{
+            .key = .{ .unicode = 'j' },
+            .mods = .{ .super = true, .shift = true },
+        }, keybinds.set.getTrigger(.ai_command_entry).?);
     }
 
     test "formatConfig single" {

@@ -30,6 +30,11 @@ struct TerminalCommandPaletteView: View {
     /// The update view model for showing update commands.
     var updateViewModel: UpdateViewModel?
 
+    /// Opens the native AI panel without passing text through the terminal input.
+    var onAskAI: (() -> Void)?
+
+    @State private var restoreSurfaceFocus = true
+
     /// The callback when an action is submitted.
     var onAction: ((String) -> Void)
 
@@ -60,13 +65,14 @@ struct TerminalCommandPaletteView: View {
             // When the command palette disappears we need to send focus back to the
             // surface view we were overlaid on top of. There's probably a better way
             // to handle the first responder state here but I don't know it.
-            if !newValue {
+            if !newValue && restoreSurfaceFocus {
                 // Has to be on queue because onChange happens on a user-interactive
                 // thread and Xcode is mad about this call on that.
                 DispatchQueue.main.async {
                     surfaceView.window?.makeFirstResponder(surfaceView)
                 }
             }
+            if !newValue { restoreSurfaceFocus = true }
         }
     }
 
@@ -79,8 +85,20 @@ struct TerminalCommandPaletteView: View {
         // Sort the rest. We replace ":" with a character that sorts before space
         // so that "Foo:" sorts before "Foo Bar:". Use sortKey as a tie-breaker
         // for stable ordering when titles are equal.
-        options.append(contentsOf: sortedTerminalPaletteOptions(jumpOptions + terminalOptions))
+        options.append(contentsOf: sortedTerminalPaletteOptions(aiOptions + jumpOptions + terminalOptions))
         return options
+    }
+
+    private var aiOptions: [CommandOption] {
+        guard let onAskAI else { return [] }
+        return [CommandOption(
+            title: "Ask AI",
+            description: "Write a command or investigate a problem with Pi on this Mac",
+            leadingIcon: "sparkles"
+        ) {
+            restoreSurfaceFocus = false
+            onAskAI()
+        }]
     }
 
     /// Commands for installing or canceling available updates.

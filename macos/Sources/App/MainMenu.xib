@@ -15,6 +15,8 @@
         <customObject id="bbz-4X-AYv" userLabel="AppDelegate" customClass="AppDelegate" customModule="Ghostty" customModuleProvider="target">
             <connections>
                 <outlet property="menuAbout" destination="5kV-Vb-QxS" id="Y5y-UO-NK6"/>
+                <outlet property="menuAIPanel" destination="yIH-qL-E6V" id="Pcx-3h-Oka"/>
+                <outlet property="menuAICommandEntry" destination="AIW-cM-d01" id="AIW-ou-t01"/>
                 <outlet property="menuBringAllToFront" destination="LE2-aR-0XJ" id="AP9-oK-60V"/>
                 <outlet property="menuChangeTabTitle" destination="iac-lh-Cl7" id="tId-v0-a3E"/>
                 <outlet property="menuChangeTitle" destination="24I-xg-qIq" id="kg6-kT-jNL"/>
@@ -356,6 +358,18 @@
                                 <modifierMask key="keyEquivalentModifierMask"/>
                                 <connections>
                                     <action selector="toggleReadonly:" target="-1" id="Gqx-wT-K9v"/>
+                                </connections>
+                            </menuItem>
+                            <menuItem title="AI Panel" id="yIH-qL-E6V">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="toggleAIPanel:" target="-1" id="ovS-Yi-k4N"/>
+                                </connections>
+                            </menuItem>
+                            <menuItem title="Write Command with AI" id="AIW-cM-d01">
+                                <modifierMask key="keyEquivalentModifierMask"/>
+                                <connections>
+                                    <action selector="aiCommandEntry:" target="-1" id="AIW-ac-t01"/>
                                 </connections>
                             </menuItem>
                             <menuItem isSeparatorItem="YES" id="Vkj-tP-dMZ"/>

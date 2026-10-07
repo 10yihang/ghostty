@@ -1793,6 +1793,7 @@ pub const Handler = struct {
     }
 
     fn reportPwd(self: *Handler, url_raw: []const u8) !void {
+        try self.terminal.reportPwdURI(url_raw);
         // Prevent DoS attacks by limiting url length. Headroom for
         // Linux PATH_MAX (4096) plus URI scheme/host and percent-encoding.
         const max_url_len = 4096;

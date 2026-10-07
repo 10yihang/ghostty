@@ -1864,6 +1864,77 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Synchronous command identity and completion from OSC 133 C/D.
+    export fn ghostty_surface_command_state(surface: *Surface) terminal.Terminal.SemanticCommandState {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        return core_surface.renderer_state.terminal.semantic_command_state;
+    }
+
+    /// Explain why the shell prompt cannot receive a command.
+    export fn ghostty_surface_prompt_status(surface: *Surface) terminal.Terminal.PromptStatus {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        return core_surface.renderer_state.terminal.promptStatus();
+    }
+
+    /// True only at an integrated primary-screen prompt with empty input.
+    export fn ghostty_surface_prompt_state(surface: *Surface) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        return core_surface.renderer_state.terminal.cursorIsAtEmptyPrompt();
+    }
+
+    /// Read only the current or most recently completed command's output.
+    export fn ghostty_surface_read_command_output(
+        surface: *Surface,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        const sel = core_surface.renderer_state.terminal.commandOutputSelection() orelse return false;
+        return readTextLocked(surface, sel, result);
+    }
+
+    export fn ghostty_surface_read_command_history(surface: *Surface, result: *Text) bool {
+        return readTerminalJSON(surface, result, false);
+    }
+
+    export fn ghostty_surface_read_terminal_identity(surface: *Surface, result: *Text) bool {
+        return readTerminalJSON(surface, result, true);
+    }
+
+    fn readTerminalJSON(surface: *Surface, result: *Text, identity_only: bool) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const term = core_surface.renderer_state.terminal;
+        const json = (if (identity_only)
+            term.terminalIdentityJSON(global.alloc())
+        else
+            term.commandHistoryJSON(global.alloc())) catch |err| {
+            log.warn("error reading terminal JSON err={}", .{err});
+            return false;
+        };
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = json.ptr,
+            .text_len = json.len,
+        };
+        return true;
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(

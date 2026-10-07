@@ -1474,7 +1474,14 @@ pub const StreamHandler = struct {
                     break :code std.math.cast(u8, raw) orelse 1;
                 };
 
-                self.surfaceMessageWriter(.{ .stop_command = code });
+                self.surfaceMessageWriter(.{ .stop_command = .{
+                    .exit_code = code,
+                    .record_sequence = if (self.terminal.screens.active_key == .primary and
+                        self.terminal.semantic_command_active)
+                        self.terminal.command_history.runningSequence()
+                    else
+                        0,
+                } });
             },
 
             // Handled by Terminal, no special handling by us
@@ -1493,6 +1500,7 @@ pub const StreamHandler = struct {
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+        try self.terminal.reportPwdURI(url);
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable
@@ -1557,8 +1565,12 @@ pub const StreamHandler = struct {
                 return;
             },
         };
+        self.terminal.reported_host_is_local = host_valid;
         if (!host_valid) {
-            log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
+            // Retain the reported remote identity for terminal control, while
+            // keeping it out of local file/path APIs that use trusted pwd.
+            self.terminal.setPwd("") catch unreachable;
+            self.surfaceMessageWriter(.{ .pwd_change = .{ .stable = "" } });
             return;
         }
 

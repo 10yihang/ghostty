@@ -144,9 +144,12 @@ pub const Message = union(enum) {
     start_command,
 
     /// A command has finished in the shell, stop the timer and send out
-    /// notifications as appropriate. The optional u8 is the exit code
-    /// of the command.
-    stop_command: ?u8,
+    /// notifications as appropriate. Capture the record sequence on the IO
+    /// thread at OSC D so queued events cannot acquire a later command's output.
+    stop_command: struct {
+        exit_code: ?u8,
+        record_sequence: u64,
+    },
 
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,

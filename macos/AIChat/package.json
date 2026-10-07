@@ -1,0 +1,25 @@
+{
+  "name": "ghostty-ai-chat",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test scripts/renderer.test.mjs"
+  },
+  "dependencies": {
+    "@assistant-ui/react": "0.15.25",
+    "@assistant-ui/react-markdown": "0.14.19",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "esbuild": "0.25.11",
+    "jsdom": "26.1.0",
+    "typescript": "5.9.3"
+  }
+}

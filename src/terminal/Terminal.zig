@@ -35,6 +35,7 @@ const pagepkg = @import("page.zig");
 const style = @import("style.zig");
 const PageList = @import("PageList.zig");
 const Screen = @import("Screen.zig");
+const CommandHistory = @import("CommandHistory.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Page = pagepkg.Page;
 const Cell = pagepkg.Cell;
@@ -102,6 +103,17 @@ glyph_glossary: glyph.Glossary = .empty,
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
 
+/// Synchronous shell command identity, separate from delayed app callbacks.
+semantic_command_state: SemanticCommandState = .{},
+semantic_command_active: bool = false,
+command_history: CommandHistory = .{},
+
+/// OSC 7 describes the shell's reported host, including SSH hosts. It is
+/// separate from pwd, which the desktop runtime only trusts for local paths.
+reported_host: ?[]const u8 = null,
+reported_directory: ?[]const u8 = null,
+reported_host_is_local: ?bool = null,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -163,6 +175,12 @@ flags: packed struct {
     /// Dirty flags for the renderer.
     dirty: Dirty = .{},
 } = .{},
+
+pub const SemanticCommandState = extern struct {
+    started: u64 = 0,
+    finished: u64 = 0,
+    exit_code: i32 = -1,
+};
 
 /// The various color configurations a terminal maintains and that can
 /// be set dynamically via OSC, with defaults usually coming from a
@@ -375,6 +393,9 @@ pub fn init(
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
     self.tabstops.deinit(alloc);
+    self.command_history.deinit(self.screens.get(.primary).?);
+    if (self.reported_host) |v| alloc.free(v);
+    if (self.reported_directory) |v| alloc.free(v);
     self.screens.deinit(alloc);
     self.colors.palette.deinit(alloc);
     self.pwd.deinit(alloc);
@@ -2226,6 +2247,14 @@ pub fn semanticPrompt(
         },
 
         .end_input_start_output => {
+            if (self.screens.active_key == .primary) {
+                self.command_history.start(self.screens.active, cmd, self.reported_directory, self.reported_host, self.reported_host_is_local) catch |err| {
+                    log.warn("error recording command start err={}", .{err});
+                };
+                self.semantic_command_state.started +%= 1;
+                self.semantic_command_state.exit_code = -1;
+                self.semantic_command_active = true;
+            }
             // "End of input, and start of output."
             self.screens.active.cursorSetSemanticContent(.output);
 
@@ -2246,6 +2275,14 @@ pub fn semanticPrompt(
         },
 
         .end_command => {
+            if (self.screens.active_key == .primary and self.semantic_command_active) {
+                self.command_history.finish(self.screens.active, cmd.readOption(.exit_code), false) catch |err| {
+                    log.warn("error recording command output err={}", .{err});
+                };
+                self.semantic_command_state.finished = self.semantic_command_state.started;
+                self.semantic_command_state.exit_code = cmd.readOption(.exit_code) orelse -1;
+                self.semantic_command_active = false;
+            }
             // From a terminal state perspective, this doesn't really do
             // anything. Other terminals appear to do nothing here. I think
             // its reasonable at this point to reset our semantic content
@@ -2305,6 +2342,82 @@ pub fn cursorIsAtPrompt(self: *Terminal) bool {
         .input, .prompt => true,
         .output => false,
     };
+}
+
+/// True only after the shell has finished an OSC 133 primary prompt and its
+/// visible input is empty. Inspect the whole prompt region, not just the text
+/// before the cursor, so cursor movement and continuation lines cannot hide a
+/// pending command. Without shell integration this always returns false.
+pub const PromptStatus = enum(c_int) {
+    ready,
+    no_shell_integration,
+    alternate_screen,
+    command_running,
+    prompt_not_ready,
+    secondary_prompt,
+    prompt_boundary_missing,
+    stale_prompt,
+    input_not_empty,
+    unmarked_prompt_text,
+};
+
+pub fn cursorIsAtEmptyPrompt(self: *Terminal) bool {
+    return self.promptStatus() == .ready;
+}
+
+pub fn promptStatus(self: *Terminal) PromptStatus {
+    if (self.screens.active_key != .primary) return .alternate_screen;
+    if (self.semantic_command_active) return .command_running;
+    const screen = self.screens.active;
+    if (!screen.semantic_prompt.seen) return .no_shell_integration;
+    if (screen.cursor.semantic_content != .input) return .prompt_not_ready;
+    if (screen.semantic_prompt.secondary_input) return .secondary_prompt;
+
+    var prompts = screen.cursor.page_pin.promptIterator(.left_up, null);
+    const prompt = prompts.next() orelse return .prompt_boundary_missing;
+    // A pruned initial prompt is insufficient to establish an empty command.
+    if (prompt.rowAndCell().row.semantic_prompt != .prompt) return .prompt_boundary_missing;
+
+    var following = prompt.promptIterator(.right_down, null);
+    _ = following.next();
+    // The cursor must belong to the most recent prompt, not an older one.
+    if (following.next() != null) return .stale_prompt;
+
+    var at_or_after_cursor = false;
+    var cells = prompt.cellIterator(.right_down, screen.pages.getBottomRight(.screen));
+    while (cells.next()) |pin| {
+        if (pin.eql(screen.cursor.page_pin.*) and !screen.cursor.pending_wrap) at_or_after_cursor = true;
+        const cell = pin.rowAndCell().cell;
+        // Ignore prompt decoration, including right-side prompts. Unexpected
+        // output within this region also makes the state unsafe to reuse.
+        if (cell.semantic_content == .prompt or !cell.hasText()) continue;
+        // ZLE erases an old draft by printing spaces and returning the cursor
+        // to input start. Those trailing blanks are not a pending command.
+        // Spaces before the cursor still count as user-entered input.
+        if (at_or_after_cursor and cell.semantic_content == .input and
+            cell.content_tag == .codepoint and cell.codepoint() == ' ') continue;
+        return if (cell.semantic_content == .input) .input_not_empty else .unmarked_prompt_text;
+    }
+    return .ready;
+}
+
+/// The output region of the running command, or the immediately preceding
+/// command once a new prompt has begun. Never search further back when that
+/// command has no output, since that would return unrelated historical text.
+pub fn commandOutputSelection(self: *Terminal) ?@import("Selection.zig") {
+    if (self.screens.active_key != .primary) return null;
+    const screen = self.screens.active;
+    if (!screen.semantic_prompt.seen) return null;
+
+    var prompts = screen.cursor.page_pin.promptIterator(.left_up, null);
+    var prompt = prompts.next() orelse return null;
+    if (screen.cursor.semantic_content != .output) {
+        prompt = prompts.next() orelse return null;
+    }
+    // Don't capture from a continuation whose originating prompt was pruned.
+    if (prompt.rowAndCell().row.semantic_prompt != .prompt) return null;
+    const output = screen.pages.highlightSemanticContent(prompt, .output) orelse return null;
+    return .init(output.start, output.end, false);
 }
 
 /// Horizontal tab moves the cursor to the next tabstop, clearing
@@ -4700,6 +4813,87 @@ pub fn getPwd(self: *const Terminal) ?[:0]const u8 {
     return self.pwd.items[0 .. self.pwd.items.len - 1 :0];
 }
 
+/// Retain remote identity for UI and command records without granting a remote
+/// directory the privileges of a local working directory.
+pub fn reportPwdURI(self: *Terminal, url: []const u8) !void {
+    if (url.len == 0) {
+        try self.setReportedDirectory(null, null, null);
+        return;
+    }
+    if (url.len > 4096) return;
+    const uri = @import("../os/uri.zig").parse(url, .{
+        .mac_address = true,
+        .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
+    }) catch return;
+    if (!std.mem.eql(u8, uri.scheme, "file") and !std.mem.eql(u8, uri.scheme, "kitty-shell-cwd")) return;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = uri.getHost(&host_buffer) catch return;
+    var arena: std.heap.ArenaAllocator = .init(self.gpa());
+    defer arena.deinit();
+    const path = try uri.path.toRawMaybeAlloc(arena.allocator());
+    if (path.len == 0 or path[0] != '/' or !std.unicode.utf8ValidateSlice(path) or !std.unicode.utf8ValidateSlice(host.bytes)) return;
+    try self.setReportedDirectory(host.bytes, path, null);
+}
+
+pub fn setReportedDirectory(self: *Terminal, host: ?[]const u8, directory: ?[]const u8, local: ?bool) !void {
+    const host_changed = if (self.reported_host) |old|
+        if (host) |new| !std.mem.eql(u8, old, new) else true
+    else
+        host != null;
+    const new_host = if (host) |v| try self.gpa().dupe(u8, v) else null;
+    errdefer if (new_host) |v| self.gpa().free(v);
+    const new_directory = if (directory) |v| try self.gpa().dupe(u8, v) else null;
+    errdefer if (new_directory) |v| self.gpa().free(v);
+    if (host_changed and self.semantic_command_active) {
+        // A local ssh process and a remote integrated shell do not share one
+        // C/D pair. Returning locally cannot finish a remote command with the
+        // outer ssh process's exit code.
+        self.command_history.finish(self.screens.get(.primary).?, null, true) catch |err| {
+            log.warn("error freezing command on host change err={}", .{err});
+        };
+        self.semantic_command_state.finished = self.semantic_command_state.started;
+        self.semantic_command_state.exit_code = -1;
+        self.semantic_command_active = false;
+    }
+    if (self.reported_host) |v| self.gpa().free(v);
+    if (self.reported_directory) |v| self.gpa().free(v);
+    self.reported_host = new_host;
+    self.reported_directory = new_directory;
+    self.reported_host_is_local = local;
+}
+
+pub fn commandHistoryJSON(self: *Terminal, alloc: Allocator) ![:0]const u8 {
+    try self.command_history.refresh(self.screens.get(.primary).?);
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    try std.json.Stringify.value(.{
+        .schemaVersion = @as(u32, 1),
+        .recordSequence = self.command_history.sequence,
+        .host = self.reported_host,
+        .directory = self.reported_directory,
+        .hostIsLocal = self.reported_host_is_local,
+        .shellIntegrated = self.screens.get(.primary).?.semantic_prompt.seen,
+        .promptStatus = @intFromEnum(self.promptStatus()),
+        .commands = self.command_history,
+    }, .{}, &writer.writer);
+    return try writer.toOwnedSliceSentinel(0);
+}
+
+pub fn terminalIdentityJSON(self: *Terminal, alloc: Allocator) ![:0]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    try std.json.Stringify.value(.{
+        .schemaVersion = @as(u32, 1),
+        .recordSequence = self.command_history.sequence,
+        .host = self.reported_host,
+        .directory = self.reported_directory,
+        .hostIsLocal = self.reported_host_is_local,
+        .shellIntegrated = self.screens.get(.primary).?.semantic_prompt.seen,
+        .promptStatus = @intFromEnum(self.promptStatus()),
+    }, .{}, &writer.writer);
+    return try writer.toOwnedSliceSentinel(0);
+}
+
 test "Terminal: setPwd preserves a sentinel on allocation failure" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const alloc = failing.allocator();
@@ -4970,8 +5164,14 @@ pub fn fullReset(self: *Terminal) void {
     // Remove alternate screen
     self.screens.remove(self.screens.active.alloc, .alternate);
 
+    self.command_history.finish(self.screens.active, null, true) catch |err| {
+        log.warn("error freezing reset command history err={}", .{err});
+    };
+
     // Reset primary screen
     self.screens.active.reset();
+    self.semantic_command_state = .{};
+    self.semantic_command_active = false;
 
     // Reset our basic state
     self.flags = .{
@@ -4989,6 +5189,7 @@ pub fn fullReset(self: *Terminal) void {
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();
+    self.setReportedDirectory(null, null, null) catch unreachable;
     self.title.clearRetainingCapacity();
     self.glyph_glossary.clearAndFree(self.gpa());
     // A reset only interrupts an in-progress chunked OSC 72 command;
@@ -15259,6 +15460,346 @@ test "Terminal: eraseDisplay complete preserves cursor" {
     // active cursor.
     t.eraseDisplay(.complete, false);
     try testing.expect(t.screens.active.cursor.style_id != style.default_id);
+}
+
+test "Terminal: agent empty prompt includes all pending input" {
+    const cases = [_]struct { input: []const u8, empty: bool }{
+        .{ .input = "$ ", .empty = false }, // No shell integration.
+        .{ .input = "\x1b]133;A\x07$ ", .empty = false }, // Prompt still being drawn.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07", .empty = true },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07echo", .empty = false },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07echo\x1b[4D", .empty = false },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07 ", .empty = false },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07abcdefghijklmnopqrstu", .empty = false },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07echo 'first\r\n\x1b]133;P;k=s\x07> \x1b]133;B\x07", .empty = false },
+        // An empty secondary prompt is not an empty primary command line.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;P;k=s\x07> \x1b]133;B\x07", .empty = false },
+        .{ .input = "\x1b]133;A\x07title\r\n$ \x1b]133;B\x07", .empty = true }, // Multiline PS1.
+        // Shipped zsh integration inserts P;k=s into multiline PS1 before B.
+        .{ .input = "\x1b]133;A\x07title\r\n\x1b]133;P;k=s\x07$ \x1b]133;B\x07", .empty = true },
+        .{ .input = "\x1b]133;A\x07title\r\n\x1b]133;P;k=c\x07$ \x1b]133;B\x07", .empty = true },
+        .{ .input = "\x1b]133;A\x07title\r\n\x1b]133;P;k=s\x07$ \x1b]133;B\x07pending", .empty = false },
+        // Right prompt decoration must not erase an already established PS2.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;P;k=s\x07> \x1b]133;B\x07\x1b[2;18H\x1b]133;P;k=r\x07z\x1b]133;B\x07", .empty = false },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07abc\x1b[3D\x1b[K", .empty = true }, // Deleted draft.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07draft\x1b[5D     \x1b[5D", .empty = true }, // ZLE blank redraw.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07 echo\x1b[5D", .empty = false }, // Nonblank draft after cursor.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07                  ", .empty = false }, // Space at pending wrap.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C\x07\r\nrunning", .empty = false },
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C\x07\r\n\x1b]133;A\x07$ \x1b]133;B\x07", .empty = false }, // Missing completion.
+        // The cursor cannot make a previous prompt current again.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;A\x07$ \x1b]133;B\x07\x1b[1A", .empty = false },
+        // Right-side prompt decoration does not count as input.
+        .{ .input = "\x1b]133;A\x07$ \x1b]133;B\x07\x1b[1;18H\x1b]133;P;k=r\x07z\x1b]133;B\x07\x1b[1;3H", .empty = true },
+    };
+    for (cases) |case| {
+        var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 8 });
+        defer t.deinit(testing.allocator);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice(case.input);
+        try testing.expectEqual(case.empty, t.cursorIsAtEmptyPrompt());
+    }
+}
+
+test "Terminal: agent prompt status distinguishes integration and input" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 30, .rows = 8 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("$ ");
+    try testing.expectEqual(PromptStatus.no_shell_integration, t.promptStatus());
+    // A theme can draw decoration before the integration fallback marks input.
+    stream.nextSlice("\x1b]133;P;k=i\x07\x1b]133;B\x07");
+    try testing.expectEqual(PromptStatus.unmarked_prompt_text, t.promptStatus());
+    t.fullReset();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07");
+    try testing.expectEqual(PromptStatus.ready, t.promptStatus());
+    stream.nextSlice("pending\x1b[7D");
+    try testing.expectEqual(PromptStatus.input_not_empty, t.promptStatus());
+    stream.nextSlice("\x1b]133;C\x07");
+    try testing.expectEqual(PromptStatus.command_running, t.promptStatus());
+}
+
+test "Terminal: agent prompt rejects alternate screen and pruned initial prompt" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07");
+    try testing.expect(t.cursorIsAtEmptyPrompt());
+    _ = try t.switchScreen(.alternate);
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07");
+    try testing.expect(!t.cursorIsAtEmptyPrompt());
+    try testing.expect(t.commandOutputSelection() == null);
+    _ = try t.switchScreen(.primary);
+    t.screens.active.cursor.page_row.semantic_prompt = .prompt_continuation;
+    try testing.expect(!t.cursorIsAtEmptyPrompt());
+}
+
+test "Terminal: agent command output excludes older history and prompt input" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 30, .rows = 12 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("unrelated startup text\r\n");
+    try testing.expect(t.commandOutputSelection() == null);
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07first\x1b]133;C\x07\r\nold output\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    {
+        const sel = t.commandOutputSelection().?;
+        const output = try t.screens.active.selectionString(testing.allocator, .{ .sel = sel, .trim = true });
+        defer testing.allocator.free(output);
+        try testing.expectEqualStrings("old output", output);
+    }
+    stream.nextSlice("second\x1b]133;C\x07\r\nnew output\r\nsecond line");
+    {
+        const sel = t.commandOutputSelection().?;
+        const output = try t.screens.active.selectionString(testing.allocator, .{ .sel = sel, .trim = true });
+        defer testing.allocator.free(output);
+        try testing.expectEqualStrings("new output\nsecond line", output);
+    }
+    stream.nextSlice("\r\n\x1b]133;D;2\x07\x1b]133;A\x07$ \x1b]133;B\x07draft");
+    {
+        const sel = t.commandOutputSelection().?;
+        const output = try t.screens.active.selectionString(testing.allocator, .{ .sel = sel, .trim = true });
+        defer testing.allocator.free(output);
+        try testing.expectEqualStrings("new output\nsecond line", output);
+    }
+    stream.nextSlice("\x1b]133;C\x07\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    // A command with no output must not reuse the preceding command's text.
+    try testing.expect(t.commandOutputSelection() == null);
+}
+
+test "Terminal: agent multiline right prompt preserves previous command output" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 30, .rows = 12 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07\r\ncommand-only\r\n\x1b]133;D;0\x07");
+    stream.nextSlice("\x1b]133;A\x07title\r\n\x1b]133;P;k=s\x07> \x1b]133;B\x07");
+    // ZLE paints RPROMPT on the final PS1 line after the input boundary.
+    // The right prompt must not split this continuation into a new command.
+    stream.nextSlice("\x1b[4;18H\x1b]133;P;k=r\x07clock\x1b]133;B\x07\x1b[4;3H");
+    try testing.expect(t.cursorIsAtEmptyPrompt());
+    const selection = t.commandOutputSelection() orelse return error.TestUnexpectedResult;
+    const output = try t.screens.active.selectionString(testing.allocator, .{ .sel = selection, .trim = true });
+    defer testing.allocator.free(output);
+    try testing.expectEqualStrings("command-only", output);
+}
+
+test "Terminal: command history separates manual failures and empty commands" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 50, .rows = 12 });
+    defer t.deinit(testing.allocator);
+    try t.setReportedDirectory("localhost", "/first", true);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07first\x1b]133;C\x07\r\nfirst-output\r\n\x1b]133;D;1\x07");
+    try t.setReportedDirectory("localhost", "/second", true);
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07third\x1b]133;C\x07\r\nthird-output\r\n\x1b]133;D;0\x07");
+    const records = t.command_history.entries.items;
+    try testing.expectEqual(@as(usize, 3), records.len);
+    try testing.expectEqualStrings("first", records[0].record.command.?);
+    try testing.expectEqualStrings("first-output", records[0].record.output);
+    try testing.expectEqual(@as(?i32, 1), records[0].record.exitCode);
+    try testing.expectEqualStrings("/first", records[0].record.directory.?);
+    try testing.expectEqualStrings("true", records[1].record.command.?);
+    try testing.expectEqualStrings("", records[1].record.output);
+    try testing.expectEqualStrings("/second", records[1].record.directory.?);
+    try testing.expectEqualStrings("third-output", records[2].record.output);
+    try testing.expect(records[0].record.startedAt > 0);
+    try testing.expect(records[0].record.finishedAt.? >= records[0].record.startedAt);
+    try testing.expect(records[0].record.durationMs != null);
+    const json = try t.commandHistoryJSON(testing.allocator);
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.object.get("commands").?.array.items.len);
+}
+
+test "Terminal: command history captures completion identity before OSC D" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    try testing.expectEqual(@as(u64, 0), t.command_history.runningSequence());
+
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07first\x1b]133;C\x07\r\nfirst-output\r\n");
+    const first_event_sequence = t.command_history.runningSequence();
+    try testing.expectEqual(@as(u64, 1), first_event_sequence);
+    stream.nextSlice("\x1b]133;D;1\x07");
+    try testing.expectEqual(@as(u64, 0), t.command_history.runningSequence());
+
+    // Equal exit codes do not merge queued events. The captured sequence
+    // remains the first record even after the next command has completed.
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07second\x1b]133;C\x07\r\nsecond-output\r\n");
+    const second_event_sequence = t.command_history.runningSequence();
+    try testing.expectEqual(@as(u64, 2), second_event_sequence);
+    stream.nextSlice("\x1b]133;D;1\x07");
+    try testing.expectEqual(@as(u64, 0), t.command_history.runningSequence());
+    try testing.expectEqual(first_event_sequence, t.command_history.entries.items[0].record.sequence);
+    try testing.expectEqual(second_event_sequence, t.command_history.entries.items[1].record.sequence);
+
+    // A host transition closes the outer command as interrupted. A later
+    // outer-shell OSC D must not correlate it or the previous completed row.
+    stream.nextSlice("\x1b]7;file://localhost/local\x07\x1b]133;A\x07$ \x1b]133;B\x07ssh remote\x1b]133;C\x07\r\n");
+    try testing.expectEqual(@as(u64, 3), t.command_history.runningSequence());
+    stream.nextSlice("\x1b]7;file://remote/home/test\x07");
+    try testing.expectEqual(@as(u64, 0), t.command_history.runningSequence());
+    stream.nextSlice("\x1b]133;D;1\x07");
+    try testing.expectEqual(@as(u64, 0), t.command_history.runningSequence());
+}
+
+test "Terminal: command history excludes multiline and right prompt decoration" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;A\x07title\r\n\x1b]133;P;k=s\x07$ \x1b]133;B\x07printf 'hello\r\n\x1b]133;P;k=s\x07> \x1b]133;B\x07world'\x1b[3;32H\x1b]133;P;k=r\x07clock\x1b]133;B\x07\x1b[3;9H\x1b]133;C\x07\r\nhello\r\nworld\r\n\x1b]133;D;0\x07");
+    const record = t.command_history.entries.items[0].record;
+    try testing.expectEqualStrings("printf 'hello\nworld'", record.command.?);
+    try testing.expectEqualStrings("hello\nworld", record.output);
+    try testing.expectEqual(.screen, record.commandSource);
+}
+
+test "Terminal: command history uses shell command annotation before screen fallback" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 25, .rows = 8 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07echo visible\x1b]133;C;cmdline_url=printf%20%27one%5Cntwo%27\x07\r\none\r\ntwo\r\n\x1b]133;D;7\x07");
+    const record = t.command_history.entries.items[0].record;
+    try testing.expectEqualStrings("printf 'one\\ntwo'", record.command.?);
+    try testing.expectEqual(.shell, record.commandSource);
+    try testing.expectEqual(@as(?i32, 7), record.exitCode);
+}
+
+test "Terminal: command history SSH identity transitions close outer command honestly" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 40, .rows = 16 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]7;file://localhost/local%20project\x07\x1b]133;A\x07$ \x1b]133;B\x07ssh test-host\x1b]133;C\x07\r\nconnected\r\n");
+    stream.nextSlice("\x1b]7;kitty-shell-cwd://test-host/home/remote\x07\x1b]133;A\x07remote$ \x1b]133;B\x07");
+    try testing.expectEqualStrings("test-host", t.reported_host.?);
+    try testing.expectEqualStrings("/home/remote", t.reported_directory.?);
+    try testing.expect(t.cursorIsAtEmptyPrompt());
+    const outer = t.command_history.entries.items[0].record;
+    try testing.expectEqualStrings("localhost", outer.host.?);
+    try testing.expectEqualStrings("/local project", outer.directory.?);
+    try testing.expect(outer.interrupted);
+    try testing.expectEqual(@as(?i32, null), outer.exitCode);
+    try testing.expectEqualStrings("connected", outer.output);
+    stream.nextSlice("pwd\x1b]133;C\x07\r\n/home/remote\r\n\x1b]133;D;0\x07\x1b]133;A\x07remote$ \x1b]133;B\x07");
+    stream.nextSlice("exit\x1b]133;C\x07\r\n\x1b]7;file://localhost/local%20project\x07\x1b]133;D;3\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    try testing.expect(t.cursorIsAtEmptyPrompt());
+    try testing.expectEqualStrings("localhost", t.reported_host.?);
+    const remote = t.command_history.entries.items[1].record;
+    try testing.expectEqualStrings("test-host", remote.host.?);
+    try testing.expectEqualStrings("/home/remote", remote.output);
+    try testing.expectEqual(@as(?i32, 0), remote.exitCode);
+    // The outer ssh D cannot rewrite the remote exit result.
+    try testing.expectEqual(@as(?i32, null), t.command_history.entries.items[2].record.exitCode);
+    try testing.expect(t.command_history.entries.items[2].record.interrupted);
+}
+
+test "Terminal: command history remains bounded and reset preserves completed records" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 40, .rows = 6 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..102) |_| stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+    try testing.expectEqual(@as(usize, 100), t.command_history.entries.items.len);
+    try testing.expectEqual(@as(u64, 3), t.command_history.entries.items[0].record.sequence);
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07sleep\x1b]133;C\x07\r\npartial\r\n");
+    t.fullReset();
+    try testing.expectEqual(@as(usize, 100), t.command_history.entries.items.len);
+    const stopped = t.command_history.entries.items[99].record;
+    try testing.expect(stopped.interrupted);
+    try testing.expectEqualStrings("partial", stopped.output);
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+    try testing.expectEqual(@as(u64, 104), t.command_history.entries.items[99].record.sequence);
+}
+
+test "Terminal: command history JSON exposes reset-stable record sequence" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 30, .rows = 6 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..2) |_| stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+    t.fullReset();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+    // The control protocol's C/D counters reset on RIS, while the history
+    // identity remains monotonic and does not depend on wall-clock time.
+    try testing.expectEqual(@as(u64, 1), t.semantic_command_state.started);
+    const identity = try t.terminalIdentityJSON(testing.allocator);
+    defer testing.allocator.free(identity);
+    const parsed_identity = try std.json.parseFromSlice(std.json.Value, testing.allocator, identity, .{});
+    defer parsed_identity.deinit();
+    try testing.expectEqual(@as(i64, 3), parsed_identity.value.object.get("recordSequence").?.integer);
+    const history = try t.commandHistoryJSON(testing.allocator);
+    defer testing.allocator.free(history);
+    const parsed_history = try std.json.parseFromSlice(std.json.Value, testing.allocator, history, .{});
+    defer parsed_history.deinit();
+    try testing.expectEqual(@as(i64, 3), parsed_history.value.object.get("recordSequence").?.integer);
+    const records = parsed_history.value.object.get("commands").?.array.items;
+    try testing.expectEqual(@as(i64, 3), records[records.len - 1].object.get("sequence").?.integer);
+}
+
+test "Terminal: command history bounds output on UTF8 boundaries and reports pruning" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 8 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07long-output\x1b]133;C\x07\r\n");
+    for (0..30_000) |_| stream.nextSlice("中");
+    stream.nextSlice("\r\n\x1b]133;D;0\x07");
+    const record = t.command_history.entries.items[0].record;
+    try testing.expect(record.output.len <= CommandHistory.max_output_bytes);
+    try testing.expect(record.outputTruncated);
+    try testing.expect(std.unicode.utf8ValidateSlice(record.output));
+    try testing.expectEqualStrings("long-output", record.command.?);
+
+    var pruned = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 8, .max_scrollback_bytes = 0 });
+    defer pruned.deinit(testing.allocator);
+    var pruned_stream = pruned.vtStream();
+    defer pruned_stream.deinit();
+    pruned_stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07many-lines\x1b]133;C\x07\r\n");
+    for (0..2_000) |_| pruned_stream.nextSlice("this-command-only\r\n");
+    pruned_stream.nextSlice("last-line\r\n\x1b]133;D;0\x07");
+    const pruned_record = pruned.command_history.entries.items[0].record;
+    try testing.expect(pruned_record.outputTruncated);
+    try testing.expect(std.mem.endsWith(u8, pruned_record.output, "last-line"));
+    try testing.expectEqualStrings("many-lines", pruned_record.command.?);
+}
+
+test "Terminal: agent command counters are synchronous primary C D pairs" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(testing.allocator);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b]133;D;9\x07"); // An unpaired D cannot finish a command.
+    try testing.expectEqual(SemanticCommandState{}, t.semantic_command_state);
+    stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07cmd\x1b]133;C\x07");
+    try testing.expectEqual(SemanticCommandState{ .started = 1 }, t.semantic_command_state);
+    stream.nextSlice("\r\n\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    try testing.expectEqual(SemanticCommandState{ .started = 1, .finished = 1, .exit_code = 7 }, t.semantic_command_state);
+    try testing.expect(t.cursorIsAtEmptyPrompt());
+    stream.nextSlice("\x1b]133;D;0\x07"); // A duplicate D cannot change the result.
+    try testing.expectEqual(@as(i32, 7), t.semantic_command_state.exit_code);
+    stream.nextSlice("\x1b]133;C\x07\x1b]133;D\x07");
+    try testing.expectEqual(SemanticCommandState{ .started = 2, .finished = 2 }, t.semantic_command_state);
+    _ = try t.switchScreen(.alternate);
+    stream.nextSlice("\x1b]133;C\x07\x1b]133;D;3\x07");
+    try testing.expectEqual(SemanticCommandState{ .started = 2, .finished = 2 }, t.semantic_command_state);
+    _ = try t.switchScreen(.primary);
+    stream.nextSlice("\x1b]133;C\x07");
+    t.fullReset();
+    try testing.expectEqual(SemanticCommandState{}, t.semantic_command_state);
+    try testing.expect(!t.semantic_command_active);
+    try testing.expect(!t.cursorIsAtEmptyPrompt());
+    stream.nextSlice("\x1b]133;D;1\x07");
+    try testing.expectEqual(SemanticCommandState{}, t.semantic_command_state);
 }
 
 test "Terminal: semantic prompt" {

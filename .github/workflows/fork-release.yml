@@ -1,0 +1,253 @@
+name: Fork Release
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: Rebuild the current fork even if its published source is unchanged
+        type: boolean
+        default: false
+
+# All source execution uses a read-only token. Only the final trusted publisher
+# may update the fork, and inherited upstream releases have separate repo guards.
+permissions:
+  contents: read
+
+concurrency:
+  group: ghostty-ai-fork-release
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  FORK_REPOSITORY: 10yihang/ghostty
+  FEED_URL: https://github.com/10yihang/ghostty/releases/latest/download/appcast.xml
+  SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+
+jobs:
+  plan:
+    if: github.repository == '10yihang/ghostty' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+      merged: ${{ steps.plan.outputs.merged }}
+      base: ${{ steps.plan.outputs.base }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+      upstream_sha: ${{ steps.plan.outputs.upstream_sha }}
+      upstream_tag: ${{ steps.plan.outputs.upstream_tag }}
+      source_version: ${{ steps.plan.outputs.source_version }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check public update identity
+        run: |
+          python3 - <<'PY'
+          import base64, os
+          key = os.environ['SPARKLE_PUBLIC_KEY']
+          if not key or len(base64.b64decode(key, validate=True)) != 32:
+              raise SystemExit('Set the fork SPARKLE_PUBLIC_KEY repository variable before releasing')
+          PY
+      - name: Test sync safety using isolated local Git fixtures
+        run: python3 -m unittest discover -s .github/scripts -p test_fork_sync.py -v
+      - name: Plan published stable upstream merge
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REBUILD: ${{ inputs.rebuild || false }}
+        run: |
+          arguments=(--output "$RUNNER_TEMP/fork-plan")
+          if [[ "$REBUILD" == true ]]; then arguments+=(--rebuild); fi
+          python3 .github/scripts/fork-sync.py plan "${arguments[@]}"
+      - name: Keep immutable candidate and planning metadata
+        if: steps.plan.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-plan
+          path: ${{ runner.temp }}/fork-plan
+          retention-days: 7
+          if-no-files-found: error
+
+  build:
+    needs: plan
+    if: github.repository == '10yihang/ghostty' && github.ref == 'refs/heads/main' && needs.plan.outputs.changed == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      BASE: ${{ needs.plan.outputs.base }}
+      CANDIDATE: ${{ needs.plan.outputs.candidate }}
+      MERGED: ${{ needs.plan.outputs.merged }}
+      BUILD_NUMBER: ${{ needs.plan.outputs.version }}
+      SOURCE_VERSION: ${{ needs.plan.outputs.source_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fork-plan
+          path: ${{ runner.temp }}/fork-plan
+      - name: Select the exact detached candidate
+        run: |
+          if [[ "$MERGED" == true ]]; then
+            git bundle verify "$RUNNER_TEMP/fork-plan/candidate.bundle"
+            git fetch "$RUNNER_TEMP/fork-plan/candidate.bundle" refs/fork/candidate:refs/fork/candidate
+          fi
+          git checkout --detach "$CANDIDATE"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+          test "$(uname -m)" = arm64
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: macos/AIChat/package-lock.json
+      - name: Read candidate Zig version
+        id: zig
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          source = Path('build.zig.zon').read_text()
+          version = re.search(r'\.minimum_zig_version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', source)
+          if version is None:
+              raise SystemExit('Candidate has no pinned stable Zig version')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version[1] + '\n')
+          PY
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+      - name: Install the pinned Pi test runtime
+        run: |
+          npm install --global @earendil-works/pi-coding-agent@0.87.1
+          printf 'GHOSTTY_PI_PACKAGE=%s/@earendil-works/pi-coding-agent\n' "$(npm root --global)" >> "$GITHUB_ENV"
+      - name: Build and verify chat and Pi policies
+        run: |
+          npm --prefix macos/AIChat ci
+          npm --prefix macos/AIChat run typecheck
+          npm --prefix macos/AIChat test
+          node --test macos/Tests/AI/TerminalAIPolicy.test.mjs
+          python3 -m unittest discover -s .github/scripts -p 'test_fork_*.py' -v
+      - name: Install Xcode Metal components
+        run: |
+          sudo xcodebuild -runFirstLaunch
+          xcodebuild -downloadComponent MetalToolchain
+      - name: Test core command records and prompt safety
+        run: |
+          zig build test -Demit-macos-app=false -Dtest-filter="command history"
+          zig build test -Demit-macos-app=false -Dtest-filter=prompt
+      - name: Build Debug framework and test the native app
+        run: |
+          zig build -Doptimize=Debug -Demit-macos-app=false -Dxcframework-target=native
+          env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+            xcodebuild -project macos/Ghostty.xcodeproj -scheme Ghostty \
+            -configuration Debug -arch arm64 -skip-testing GhosttyUITests \
+            SYMROOT="$GITHUB_WORKSPACE/macos/build" test
+      - name: Build ReleaseFast app and prepare a fork-only archive
+        run: |
+          zig build -Doptimize=ReleaseFast -Dxcframework-target=native
+          python3 .github/scripts/fork-package.py prepare \
+            --app macos/build/ReleaseLocal/Ghostty.app \
+            --public-key "$SPARKLE_PUBLIC_KEY" --version "$BUILD_NUMBER" \
+            --source-version "$SOURCE_VERSION" --feed-url "$FEED_URL" \
+            --output "$RUNNER_TEMP/fork-release"
+      - name: Upload the tested archive without signing secrets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-release
+          path: ${{ runner.temp }}/fork-release
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    if: github.repository == '10yihang/ghostty' && github.ref == 'refs/heads/main' && needs.plan.outputs.changed == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      BASE: ${{ needs.plan.outputs.base }}
+      CANDIDATE: ${{ needs.plan.outputs.candidate }}
+      UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+      SOURCE_VERSION: ${{ needs.plan.outputs.source_version }}
+      BUILD_NUMBER: ${{ needs.plan.outputs.version }}
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # Never check out candidate source here. Only baseline-owned packaging
+      # code handles the private key; the bundle supplies Git objects only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.base }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fork-plan
+          path: ${{ runner.temp }}/fork-plan
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fork-release
+          path: release
+      - name: Fetch the independently verified Sparkle signing tool
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-for-Swift-Package-Manager.zip \
+            --output "$RUNNER_TEMP/sparkle.zip"
+          printf '8d5fb41d960b43f4a68aa14126bf62b098544ec8d191cdcc73eb14e63a8e7606  %s\n' "$RUNNER_TEMP/sparkle.zip" | shasum -a 256 --check
+          ditto -x -k "$RUNNER_TEMP/sparkle.zip" "$RUNNER_TEMP/sparkle"
+      - name: Sign the immutable archive and verify its public identity
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          test -n "$SPARKLE_PRIVATE_KEY"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+            "$RUNNER_TEMP/sparkle/bin/sign_update" --ed-key-file - release/Ghostty.zip > release/sign_update.txt
+          python3 .github/scripts/fork-package.py verify \
+            --public-key "$SPARKLE_PUBLIC_KEY" --archive release/Ghostty.zip \
+            --signature-file release/sign_update.txt
+      - name: Generate the signed appcast with an immutable download URL
+        run: |
+          python3 .github/scripts/fork-package.py appcast \
+            --archive release/Ghostty.zip --signature-file release/sign_update.txt \
+            --version "$BUILD_NUMBER" --source-version "$SOURCE_VERSION" \
+            --commit "$CANDIDATE" --upstream-tag "$UPSTREAM_TAG" \
+            --download-url "https://github.com/$FORK_REPOSITORY/releases/download/$RELEASE_TAG/Ghostty.zip" \
+            --output release/appcast.xml
+      - name: Promote only the tested fast-forward candidate
+        run: |
+          python3 .github/scripts/fork-sync.py promote \
+            --plan "$RUNNER_TEMP/fork-plan/plan.json" --base "$BASE" \
+            --candidate "$CANDIDATE" --tag "$RELEASE_TAG"
+      - name: Stage release and read back every uploaded asset
+        run: |
+          gh release create "$RELEASE_TAG" --repo "$FORK_REPOSITORY" \
+            --verify-tag --draft --title "Ghostty AI $SOURCE_VERSION ($BUILD_NUMBER)" \
+            --notes "Tested AI fork commit $CANDIDATE; official stable upstream $UPSTREAM_TAG." \
+            release/Ghostty.zip release/appcast.xml release/release.json
+          gh release download "$RELEASE_TAG" --repo "$FORK_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-readback"
+          cmp release/Ghostty.zip "$RUNNER_TEMP/release-readback/Ghostty.zip"
+          cmp release/appcast.xml "$RUNNER_TEMP/release-readback/appcast.xml"
+          cmp release/release.json "$RUNNER_TEMP/release-readback/release.json"
+          test "$(git ls-remote origin refs/heads/main | cut -f 1)" = "$CANDIDATE"
+          gh release edit "$RELEASE_TAG" --repo "$FORK_REPOSITORY" --draft=false --latest
+      - name: Verify the public latest feed
+        run: |
+          for attempt in {1..12}; do
+            if curl --fail --location "$FEED_URL" --output "$RUNNER_TEMP/published-appcast.xml" && \
+               cmp -s release/appcast.xml "$RUNNER_TEMP/published-appcast.xml"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          printf 'The release was published but the public feed readback did not converge.\n' >&2
+          exit 1

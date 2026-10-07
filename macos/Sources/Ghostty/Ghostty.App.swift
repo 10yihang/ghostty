@@ -701,6 +701,15 @@ extension Ghostty {
             case GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE:
                 toggleCommandPalette(app, target: target)
 
+            case GHOSTTY_ACTION_TOGGLE_AI_PANEL:
+                toggleAIPanel(app, target: target)
+
+            case GHOSTTY_ACTION_AI_COMMAND_ENTRY:
+                if target.tag == GHOSTTY_TARGET_SURFACE, let surface = target.target.surface,
+                   let view = self.surfaceView(from: surface) {
+                    NotificationCenter.default.post(name: .ghosttyAICommandEntry, object: view)
+                }
+
             case GHOSTTY_ACTION_TOGGLE_MAXIMIZE:
                 toggleMaximize(app, target: target)
 
@@ -1146,6 +1155,25 @@ extension Ghostty {
                     name: .ghosttyCommandPaletteDidToggle,
                     object: surfaceView
                 )
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func toggleAIPanel(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s
+        ) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("toggle AI panel does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                NotificationCenter.default.post(name: .ghosttyToggleAI, object: surfaceView)
 
             default:
                 assertionFailure()
@@ -1643,6 +1671,13 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
+
+                // Keep terminal-owned exit snapshots independent of desktop
+                // notifications. A successful exit clears the same surface's snapshot.
+                NotificationCenter.default.post(
+                    name: .ghosttyCommandFinished,
+                    object: surfaceView,
+                    userInfo: ["exitCode": Int(v.exit_code), "recordSequence": v.record_sequence])
 
                 // Determine if we even care about command finish notifications
                 guard let config = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config else { return }

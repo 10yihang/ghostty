@@ -1,0 +1,3 @@
+# Keep generated third-party notices intact while checking application code.
+dist/AIChat/chat.js.LEGAL.txt whitespace=-space-before-tab
+dist/AIChat/THIRD_PARTY_LICENSES.txt -text whitespace=cr-at-eol

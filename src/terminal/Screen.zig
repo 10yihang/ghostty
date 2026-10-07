@@ -106,6 +106,14 @@ pub const SemanticPrompt = struct {
     /// we've never seen them.
     seen: bool,
 
+    /// Whether the primary prompt has reached its first input marker. Zsh
+    /// marks multiline PS1 decoration with k=s before this marker, too.
+    input_started: bool = false,
+
+    /// A continuation prompt announced after primary input began is PS2,
+    /// even when it has no visible text entered yet.
+    secondary_input: bool = false,
+
     /// This is set on any `cl` or `click_events` option set on the
     /// most recent OSC 133 commands to specify how click handling in a
     /// prompt is handling.
@@ -2877,6 +2885,7 @@ pub fn cursorSetSemanticContent(self: *Screen, t: union(enum) {
         },
 
         .input => |clear| {
+            self.semantic_prompt.input_started = true;
             cursor.semantic_content = .input;
             cursor.semantic_content_clear_eol = switch (clear) {
                 .clear_explicit => false,
@@ -2886,10 +2895,23 @@ pub fn cursorSetSemanticContent(self: *Screen, t: union(enum) {
 
         .prompt => |kind| {
             self.semantic_prompt.seen = true;
+            switch (kind) {
+                .initial => {
+                    self.semantic_prompt.input_started = false;
+                    self.semantic_prompt.secondary_input = false;
+                },
+                .continuation, .secondary => {
+                    if (self.semantic_prompt.input_started) self.semantic_prompt.secondary_input = true;
+                },
+                .right => {},
+            }
             cursor.semantic_content = .prompt;
             cursor.semantic_content_clear_eol = false;
             cursor.page_row.semantic_prompt = switch (kind) {
-                .initial, .right => .prompt,
+                .initial => .prompt,
+                // Right-side decoration belongs to the existing prompt row;
+                // making a continuation row primary invents a command boundary.
+                .right => cursor.page_row.semantic_prompt,
                 .continuation, .secondary => .prompt_continuation,
             };
         },

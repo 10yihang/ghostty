@@ -1099,6 +1099,7 @@ extension Ghostty {
         }
 
         override func keyDown(with event: NSEvent) {
+            NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
             guard let surface = self.surface else {
                 self.interpretKeyEvents([event])
                 return
@@ -1602,6 +1603,13 @@ extension Ghostty {
             // If we have a selection, add copy
             if let text = self.accessibilitySelectedText(), text.count > 0 {
                 menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
+                item = menu.addItem(
+                    withTitle: "Explain Selection with AI",
+                    action: #selector(explainSelectionWithAI(_:)),
+                    keyEquivalent: "")
+                item.target = self
+                item.representedObject = text
+                item.setImageIfDesired(systemSymbolName: "sparkles")
             }
             menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
 
@@ -1633,6 +1641,36 @@ extension Ghostty {
 
         // MARK: Menu Handlers
 
+        /// Read directly for failure snapshots so the accessibility cache cannot
+        /// substitute output captured before the command finished.
+        func visibleTextSnapshot() -> String {
+            guard let surface else { return "" }
+            let selection = ghostty_selection_s(
+                top_left: ghostty_point_s(
+                    tag: GHOSTTY_POINT_VIEWPORT,
+                    coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+                    x: 0,
+                    y: 0),
+                bottom_right: ghostty_point_s(
+                    tag: GHOSTTY_POINT_VIEWPORT,
+                    coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                    x: 0,
+                    y: 0),
+                rectangle: false)
+            var text = ghostty_text_s()
+            guard ghostty_surface_read_text(surface, selection, &text) else { return "" }
+            defer { ghostty_surface_free_text(surface, &text) }
+            return String(cString: text.text)
+        }
+
+        @IBAction func explainSelectionWithAI(_ sender: NSMenuItem) {
+            guard let selection = sender.representedObject as? String else { return }
+            NotificationCenter.default.post(
+                name: .ghosttyAskAI,
+                object: self,
+                userInfo: ["selection": selection])
+        }
+
         @IBAction func copy(_ sender: Any?) {
             guard let surface = self.surface else { return }
             let action = "copy_to_clipboard"
@@ -1642,6 +1680,7 @@ extension Ghostty {
         }
 
         @IBAction func paste(_ sender: Any?) {
+            NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
             guard let surface = self.surface else { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
@@ -1650,6 +1689,7 @@ extension Ghostty {
         }
 
         @IBAction func pasteAsPlainText(_ sender: Any?) {
+            NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
             guard let surface = self.surface else { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
@@ -1658,6 +1698,7 @@ extension Ghostty {
         }
 
         @IBAction func pasteSelection(_ sender: Any?) {
+            NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
             guard let surface = self.surface else { return }
             let action = "paste_from_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
@@ -1714,6 +1755,7 @@ extension Ghostty {
         }
 
         @IBAction func toggleReadonly(_ sender: Any?) {
+            NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
             guard let surface = self.surface else { return }
             let action = "toggle_readonly"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
@@ -1742,6 +1784,7 @@ extension Ghostty {
         }
 
         @objc func resetTerminal(_ sender: Any) {
+            NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
             guard let surface = self.surface else { return }
             let action = "reset"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
@@ -2068,6 +2111,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {
+        NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
         // We must have an associated event
         guard NSApp.currentEvent != nil else { return }
 
@@ -2300,6 +2344,7 @@ extension Ghostty.SurfaceView {
 
         if let content {
             DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .ghosttyTerminalUserInput, object: self)
                 self.surfaceModel?.sendText(content)
             }
             return true

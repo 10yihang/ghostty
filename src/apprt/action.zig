@@ -364,6 +364,12 @@ pub const Action = union(Key) {
     /// split or the window is fullscreen.
     resize_window: ResizeWindow,
 
+    /// Toggle the AI panel for the target terminal.
+    toggle_ai_panel,
+
+    /// Open the compact natural-language command composer.
+    ai_command_entry,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -436,6 +442,8 @@ pub const Action = union(Key) {
         copy_title_to_clipboard,
         move_tab_to_new_window,
         resize_window,
+        toggle_ai_panel,
+        ai_command_entry,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1006,18 +1014,35 @@ pub const CloseTabMode = enum(c_int) {
 pub const CommandFinished = struct {
     exit_code: ?u8,
     duration: configpkg.Config.Duration,
+    /// Exact command record captured at OSC D, or zero if uncorrelated.
+    record_sequence: u64,
 
     /// sync with ghostty_action_command_finished_s in ghostty.h
     pub const C = extern struct {
         exit_code: i16,
         duration: u64,
+        record_sequence: u64,
     };
 
     pub fn cval(self: CommandFinished) C {
         return .{
             .exit_code = self.exit_code orelse -1,
             .duration = self.duration.duration,
+            .record_sequence = self.record_sequence,
         };
+    }
+
+    test "CommandFinished preserves exact record sequence in C action" {
+        const value: CommandFinished = .{
+            .exit_code = 1,
+            .duration = .{ .duration = 123 },
+            .record_sequence = 42,
+        };
+        try std.testing.expectEqual(@as(i16, 1), value.cval().exit_code);
+        try std.testing.expectEqual(@as(u64, 42), value.cval().record_sequence);
+        var uncorrelated = value;
+        uncorrelated.record_sequence = 0;
+        try std.testing.expectEqual(@as(u64, 0), uncorrelated.cval().record_sequence);
     }
 };
 

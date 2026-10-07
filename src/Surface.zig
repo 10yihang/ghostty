@@ -1181,8 +1181,9 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .surface = self },
                 .command_finished,
                 .{
-                    .exit_code = v,
+                    .exit_code = v.exit_code,
                     .duration = duration,
+                    .record_sequence = v.record_sequence,
                 },
             ) catch |err| {
                 log.warn("apprt failed to notify command finish={}", .{err});
@@ -5573,6 +5574,18 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .toggle_command_palette => return try self.rt_app.performAction(
             .{ .surface = self },
             .toggle_command_palette,
+            {},
+        ),
+
+        .toggle_ai_panel => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .toggle_ai_panel,
+            {},
+        ),
+
+        .ai_command_entry => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .ai_command_entry,
             {},
         ),
 

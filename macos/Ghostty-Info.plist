@@ -106,8 +106,12 @@
 	</array>
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUFeedURL</key>
+	<string>https:&#47;&#47;github.com/10yihang/ghostty/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>wsNcGf5hirwtdXMVnYoxRIX/SqZQLMOsYlD3q3imeok=</string>
+	<string>zqkg6kqqZiBEtAfmhR81eHtucExM8NoMS/RTD40S3+g=</string>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
