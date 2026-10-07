@@ -232,6 +232,9 @@ private final class ClipboardFixture {
     }
 
     func waitForNativeSelection(_ expected: String) async throws {
+        // This fixture window is offscreen; await a native render before reading
+        // WebKit's Services selection cache, which can lag behind DOM selection.
+        _ = try await view.takeSnapshot(configuration: nil)
         // DOM selection and WebKit's native editor state arrive independently.
         // Probe native Services with a separate board before dispatching Copy or
         // Cut; this never seeds the board whose exact shortcut result we assert.

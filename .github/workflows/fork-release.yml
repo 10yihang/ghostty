@@ -151,6 +151,7 @@ jobs:
           env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
             xcodebuild -project macos/Ghostty.xcodeproj -scheme Ghostty \
             -configuration Debug -arch arm64 -skip-testing GhosttyUITests \
+            -parallel-testing-enabled NO \
             -resultBundlePath "$RUNNER_TEMP/fork-native.xcresult" \
             SYMROOT="$GITHUB_WORKSPACE/macos/build" test || native_exit=$?
           xcrun xcresulttool get test-results summary \
