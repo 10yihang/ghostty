@@ -97,7 +97,7 @@ struct TerminalAIPluginPresentationTests {
         }
         #expect(fixture.pluginSwitches.first?.isEnabled == false)
         let renderedText = try fixture.renderedText()
-        #expect(renderedText.contains("Wait for the current task"), "Rendered picker: \(renderedText)")
+        #expect(renderedText.contains("current task to finish to change plugins"), "Rendered picker: \(renderedText)")
         #expect(try fixture.inlineActionFrame("Trust and enable") == nil)
         fixture.model.stop()
         fixture.model.receive(["type": "agent_settled"])
