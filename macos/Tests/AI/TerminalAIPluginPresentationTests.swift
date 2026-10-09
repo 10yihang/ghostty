@@ -98,6 +98,7 @@ struct TerminalAIPluginPresentationTests {
         #expect(fixture.pluginSwitches.first?.isEnabled == false)
         #expect(try fixture.inlineActionFrame("Trust and enable") == nil)
         fixture.model.stop()
+        fixture.model.receive(["type": "agent_settled"])
         try await fixture.wait("Finishing the task did not unlock the plugin switch") { fixture.pluginSwitches.first?.isEnabled == true }
     }
 
@@ -153,9 +154,8 @@ private final class PluginPresentationFixture {
 
     func clickPluginSwitch(_ index: Int) throws {
         let control = try #require(pluginSwitches.indices.contains(index) ? pluginSwitches[index] : nil)
-        let target = try #require(control.window)
-        target.makeKey()
-        click(target, control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), trackingButton: true)
+        #expect(control.isEnabled)
+        control.performClick(nil)
     }
 
     // Only controlled English labels in this fixture's own rendered bitmap
@@ -240,8 +240,7 @@ private final class PluginPresentationFixture {
         host.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(200))
         try preview("panel", view: host)
-        // These coordinates are in our fixed-size native host, inside the
-        // actual AI settings gear. No event enters the system event queue.
+        // The header's native event handler tracks the release inside mouse-down.
         click(window, NSPoint(x: host.bounds.width - 94, y: host.bounds.height - 16), trackingButton: true)
         try await wait("The actual AI settings gear did not open its popover") { settingsPopover != nil }
         try preview("settings", view: try #require(settingsPopover?.contentView))
@@ -271,9 +270,8 @@ private final class PluginPresentationFixture {
         // Queue it in this test process before invoking mouse-down directly.
         if trackingButton { NSApp.postEvent(up, atStart: true) }
         target.sendEvent(down)
-        // SwiftUI's drawn buttons do not enter AppKit's tracking loop.
-        // A duplicate mouse-up after native tracking has no active press to end.
-        target.sendEvent(up)
+        // Send a direct release only when mouse-down did not consume it while tracking.
+        if !trackingButton { target.sendEvent(up) }
     }
 
     func wait(_ message: String, until predicate: () throws -> Bool) async throws {

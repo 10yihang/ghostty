@@ -238,6 +238,7 @@ struct TerminalAIPluginsView: View {
     }
 
     private func refresh() {
+        pendingPlugin = nil
         Task { await model.refreshPlugins() }
     }
 }
