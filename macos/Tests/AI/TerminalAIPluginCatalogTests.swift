@@ -3,6 +3,37 @@ import Testing
 @testable import Ghostty
 
 struct TerminalAIPluginCatalogTests {
+    @Test func builtinGuardianHasStableIdentityAndStaysOutOfPersonalScans() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let root = fixture.directory.appendingPathComponent("PiPlugins/codex-guardian", isDirectory: true)
+        try fixture.json(["name": "@fixture/codex-guardian", "version": "1.0.0", "pi": ["extensions": ["index.ts"]]],
+                         to: root.appendingPathComponent("package.json"))
+        try fixture.file("index.ts", in: root, content: "throw new Error('Discovery must not execute the guardian');")
+        let plugin = TerminalAIPluginCatalog.builtinGuardian(root: root)
+        #expect(plugin.id == "builtin:codex-guardian")
+        #expect(plugin.name == "Codex Guardian")
+        #expect(plugin.version == "1.0.0")
+        #expect(plugin.extensionPaths == [root.appendingPathComponent("index.ts").path])
+        #expect(plugin.canEnable)
+        #expect(plugin.compatibilityNote?.contains("Off by default") == true)
+        #expect(try TerminalAIPluginCatalog.scan(agentDirectory: fixture.agent).isEmpty)
+        let missing = TerminalAIPluginCatalog.builtinGuardian(root: fixture.directory.appendingPathComponent("missing-guardian"))
+        #expect(missing.id == plugin.id)
+        #expect(!missing.canEnable && missing.unavailableReason != nil)
+    }
+
+    @Test func appBundleContainsTheGuardianPackageAndEntry() throws {
+        let resources = try #require(Bundle.main.resourceURL)
+        let root = resources.appendingPathComponent("PiPlugins/codex-guardian", isDirectory: true)
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("package.json").path))
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("index.ts").path))
+        let plugin = TerminalAIPluginCatalog.builtinGuardian(root: root)
+        #expect(plugin.canEnable)
+        #expect(plugin.extensionPaths == [root.resolvingSymlinksInPath().appendingPathComponent("index.ts").path])
+        #expect(plugin.discoveryWarnings.isEmpty)
+    }
+
     @Test func discoversInstalledPackagesIncludingScopesWithoutExecutingCode() throws {
         let fixture = try Fixture()
         defer { fixture.remove() }

@@ -69,6 +69,9 @@ struct TerminalAIWebView: NSViewRepresentable {
             case "terminal_control":
                 guard let allow = record["allow"] as? Bool else { return }
                 model.terminalControlAllowed = allow
+            case "automatic_review":
+                guard record["allow"] as? Bool == false else { return }
+                model.disableAutomaticReview()
             case "approval":
                 guard let id = record["id"] as? String, id == model.approval?.id,
                       let allow = record["allow"] as? Bool else { return }

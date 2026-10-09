@@ -38,8 +38,15 @@ struct TerminalAIPlugin: Identifiable, Equatable, Sendable {
 }
 
 enum TerminalAIPluginCatalog {
+    static let builtinGuardianID = "builtin:codex-guardian"
+
     static func scan(agentDirectory: URL) throws -> [TerminalAIPlugin] {
         try Scanner().scan(agentDirectory: agentDirectory)
+    }
+
+    /// The caller explicitly adds the bundled package; personal scans stay independent.
+    static func builtinGuardian(root: URL) -> TerminalAIPlugin {
+        Scanner().builtinGuardian(root: root)
     }
 
     private final class Scanner {
@@ -47,6 +54,21 @@ enum TerminalAIPluginCatalog {
         private let maximumEntries = 16_384
         private let maximumManifestBytes = 256 * 1_024
         private var remainingEntries = 16_384
+
+        func builtinGuardian(root: URL) -> TerminalAIPlugin {
+            let root = root.standardizedFileURL.resolvingSymlinksInPath()
+            var warnings: [String] = []
+            let metadata = manifest(root, warnings: &warnings) ?? [:]
+            let pi = metadata["pi"] as? [String: Any] ?? [:]
+            let discovered = plugin(root: root, metadata: metadata, pi: pi, warnings: warnings)
+            return TerminalAIPlugin(
+                id: TerminalAIPluginCatalog.builtinGuardianID, name: "Codex Guardian", version: discovered.version,
+                summary: "Reviews terminal commands and local file changes using Codex policy and your Pi model.", root: root,
+                extensionPaths: discovered.extensionPaths, skillPaths: discovered.skillPaths, promptPaths: discovered.promptPaths,
+                compatibilityNote: "Off by default. Enabling authorizes the AI reviewer to approve terminal commands and local file changes for the next task.",
+                unavailableReason: discovered.extensionPaths.isEmpty ? "The bundled Codex Guardian extension is unavailable." : nil,
+                discoveryWarnings: discovered.discoveryWarnings)
+        }
 
         func scan(agentDirectory: URL) throws -> [TerminalAIPlugin] {
             let agent = agentDirectory.standardizedFileURL.resolvingSymlinksInPath()

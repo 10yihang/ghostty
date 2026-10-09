@@ -112,7 +112,8 @@ struct TerminalAIPluginModelTests {
         defer { fixture.remove() }
         var sent: [[String: Any]] = []
         let model = TerminalAIModel(defaults: fixture.defaults, sendCommand: { sent.append($0) },
-                                    configurationDirectory: fixture.directory.appendingPathComponent("handled"))
+                                    configurationDirectory: fixture.directory.appendingPathComponent("handled"),
+                                    builtinPluginDirectory: fixture.directory.appendingPathComponent("absent-builtin"))
         model.present(surfaceID: UUID(), directory: fixture.directory.path, selection: nil)
         model.prompt = "/fixture-command"
         model.submit()
@@ -147,7 +148,8 @@ struct TerminalAIPluginModelTests {
         defer { fixture.remove() }
         var sent: [[String: Any]] = []
         let model = TerminalAIModel(defaults: fixture.defaults, sendCommand: { sent.append($0) },
-                                    configurationDirectory: fixture.directory.appendingPathComponent("mcp-status"))
+                                    configurationDirectory: fixture.directory.appendingPathComponent("mcp-status"),
+                                    builtinPluginDirectory: fixture.directory.appendingPathComponent("absent-builtin"))
         model.present(surfaceID: UUID(), directory: fixture.directory.path, selection: nil)
         model.prompt = "Suggest a diagnostic command"
         model.submit()
@@ -183,7 +185,8 @@ struct TerminalAIPluginModelTests {
         for question in ["/tmp/fixture-log.txt 帮我分析", "/tmp 帮我分析"] {
             var sent: [[String: Any]] = []
             let model = TerminalAIModel(defaults: fixture.defaults, sendCommand: { sent.append($0) },
-                                        configurationDirectory: fixture.directory.appendingPathComponent(UUID().uuidString))
+                                        configurationDirectory: fixture.directory.appendingPathComponent(UUID().uuidString),
+                                        builtinPluginDirectory: fixture.directory.appendingPathComponent("absent-builtin"))
             model.present(surfaceID: UUID(), directory: fixture.directory.path, selection: "selected terminal evidence")
             model.prompt = question
             model.submit()
@@ -217,7 +220,8 @@ private final class PluginModelFixture {
 
     func makeModel(mode: TerminalAIModel.Mode = .assistant) -> TerminalAIModel {
         let model = TerminalAIModel(defaults: defaults, sendCommand: { _ in },
-                                    configurationDirectory: directory.appendingPathComponent("configuration"), mode: mode)
+                                    configurationDirectory: directory.appendingPathComponent("configuration"), mode: mode,
+                                    builtinPluginDirectory: directory.appendingPathComponent("absent-builtin"))
         model.workingDirectory = directory.path
         return model
     }

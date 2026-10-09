@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		CE0630000000000000000001 /* AIChat in Resources */ = {isa = PBXBuildFile; fileRef = CE0630000000000000000002 /* AIChat */; };
+		CE0630000000000000000003 /* PiPlugins in Resources */ = {isa = PBXBuildFile; fileRef = CE0630000000000000000004 /* PiPlugins */; };
 		29C15B1D2CDC3B2900520DD4 /* bat in Resources */ = {isa = PBXBuildFile; fileRef = 29C15B1C2CDC3B2000520DD4 /* bat */; };
 		55154BE02B33911F001622DC /* ghostty in Resources */ = {isa = PBXBuildFile; fileRef = 55154BDF2B33911F001622DC /* ghostty */; };
 		552964E62B34A9B400030505 /* vim in Resources */ = {isa = PBXBuildFile; fileRef = 552964E52B34A9B400030505 /* vim */; };
@@ -68,6 +69,7 @@
 
 /* Begin PBXFileReference section */
 		CE0630000000000000000002 /* AIChat */ = {isa = PBXFileReference; lastKnownFileType = folder; name = AIChat; path = AIChat/dist/AIChat; sourceTree = "<group>"; };
+		CE0630000000000000000004 /* PiPlugins */ = {isa = PBXFileReference; lastKnownFileType = folder; path = PiPlugins; sourceTree = "<group>"; };
 		29C15B1C2CDC3B2000520DD4 /* bat */ = {isa = PBXFileReference; lastKnownFileType = folder; name = bat; path = "../zig-out/share/bat"; sourceTree = "<group>"; };
 		3B39CAA42B33949B00DABEB8 /* GhosttyReleaseLocal.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = GhosttyReleaseLocal.entitlements; sourceTree = "<group>"; };
 		55154BDF2B33911F001622DC /* ghostty */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ghostty; path = "../zig-out/share/ghostty"; sourceTree = "<group>"; };
@@ -164,6 +166,7 @@
 			isa = PBXGroup;
 			children = (
 				CE0630000000000000000002 /* AIChat */,
+				CE0630000000000000000004 /* PiPlugins */,
 				FC9ABA9B2D0F538D0020D4C8 /* bash-completion */,
 				29C15B1C2CDC3B2000520DD4 /* bat */,
 				A586167B2B7703CC009BDB1D /* fish */,
@@ -390,6 +393,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				CE0630000000000000000001 /* AIChat in Resources */,
+				CE0630000000000000000003 /* PiPlugins in Resources */,
 				FC9ABA9C2D0F53F80020D4C8 /* bash-completion in Resources */,
 				A553F4142E06EB1600257779 /* Ghostty.icon in Resources */,
 				29C15B1D2CDC3B2900520DD4 /* bat in Resources */,

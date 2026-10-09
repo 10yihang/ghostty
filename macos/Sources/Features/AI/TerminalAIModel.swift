@@ -145,6 +145,9 @@ final class TerminalAIModel: ObservableObject {
     }
     @Published private(set) var availablePlugins: [TerminalAIPlugin] = []
     @Published private(set) var enabledPluginIDs: Set<String> = []
+    var isAutomaticReviewEnabled: Bool {
+        mode == .assistant && enabledPluginIDs.contains(TerminalAIPluginCatalog.builtinGuardianID)
+    }
     @Published private(set) var pluginsLoading = false
     @Published private(set) var pluginScanError: String?
     private var pluginScanID = UUID()
@@ -218,6 +221,28 @@ final class TerminalAIModel: ObservableObject {
     private var terminalTask: Task<Void, Never>?
     private var terminalRequestID: String?
     private var pendingTerminalApproval: (payload: [String: Any], target: TerminalTarget)?
+    private enum ReviewOperation {
+        case terminal(id: String, payload: [String: Any], target: TerminalTarget)
+        case file(id: String, access: TerminalAIFileAccess, write: TerminalAIFileAccess.PreparedWrite)
+
+        var id: String {
+            switch self {
+            case .terminal(let id, _, _), .file(let id, _, _): return id
+            }
+        }
+    }
+    private struct PendingReview {
+        let request: TerminalAIApprovalReview.Request
+        let operation: ReviewOperation
+        let terminalTarget: TerminalTarget
+        let workspace: String
+    }
+    private var pendingReview: PendingReview?
+    private var reviewTimeoutTask: Task<Void, Never>?
+    private var reviewPromptID: String?
+    private var guardianReady = false
+    private var reviewUserMessages: [String] = []
+    private let builtinPluginDirectory: URL
     private var systemQueryRecords: [UUID: [UInt64: SystemQueryRecord]] = [:]
     private var ownedTerminalSequence: UInt64?
     private var terminalInputObserver: NSObjectProtocol?
@@ -272,6 +297,8 @@ final class TerminalAIModel: ObservableObject {
             "messages": serializedMessages,
             "isRunning": isRunning, "phase": phase.rawValue, "status": statusLabel,
             "terminalControlAllowed": terminalControlAllowed,
+            "automaticReviewEnabled": isAutomaticReviewEnabled,
+            "commandEntryBusy": commandEntryBusy,
             "queuedInputs": pendingInputs.filter { !$0.displayed && $0.accepted }.map {
                 ["id": $0.id, "text": $0.text, "mode": $0.mode]
             },
@@ -362,7 +389,8 @@ final class TerminalAIModel: ObservableObject {
         sendCommand: (([String: Any]) throws -> Void)? = nil,
         terminalOperation: (([String: Any]) async throws -> [String: Any])? = nil,
         configurationDirectory: URL? = nil,
-        mode: Mode = .assistant
+        mode: Mode = .assistant,
+        builtinPluginDirectory: URL? = nil
     ) {
         self.defaults = defaults
         self.sendOverride = sendCommand
@@ -380,6 +408,8 @@ final class TerminalAIModel: ObservableObject {
         baseURL = defaults.string(forKey: "terminalAI.baseURL") ?? ""
         self.configurationDirectory = configurationDirectory ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/com.mitchellh.ghostty/ai/pi", isDirectory: true)
+        self.builtinPluginDirectory = builtinPluginDirectory ??
+            (Bundle.main.resourceURL ?? self.configurationDirectory).appendingPathComponent("PiPlugins/codex-guardian", isDirectory: true)
         historyStore = TerminalAIHistoryStore(directory: self.configurationDirectory.appendingPathComponent("conversations"))
         workbenchStore = TerminalAIWorkbenchStore(directory: self.configurationDirectory.appendingPathComponent("workbench"))
         mcpManager = TerminalAIMCPManager(directory: self.configurationDirectory.appendingPathComponent("mcp"))
@@ -405,6 +435,10 @@ final class TerminalAIModel: ObservableObject {
             .sink { [weak self] notification in
                 guard let self, notification.object as? Ghostty.SurfaceView === self.terminalSurface else { return }
                 self.terminalControlAllowed = false
+                self.cancelApprovalReview(reason: "You took control of the terminal. Request a new review before continuing.")
+                if self.terminalRequestID != nil, self.ownedTerminalSequence == nil {
+                    self.cancelTerminalRequest(reason: "You took control of the terminal before command dispatch.", interrupt: false)
+                }
             }
         if needsDirectorySelection {
             // Pi stays in a valid local folder; terminal tools use the bound shell,
@@ -499,6 +533,7 @@ final class TerminalAIModel: ObservableObject {
         startedAt = Date()
         setPhase(.starting, "Starting Pi")
         let question = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        reviewUserMessages = [question]
         isPiMCPStatusTask = mode == .assistant && question == "/mcp"
         if !isPiMCPStatusTask {
             suggestedCommand = ""
@@ -521,13 +556,13 @@ final class TerminalAIModel: ObservableObject {
         Help with this task in the ATTACHED terminal.
         Use ghostty_terminal read to inspect its current screen; use run whenever a shell command is needed.
         Use read, ls, find and grep for files in the local workspace (\(workingDirectory)) on THIS MAC. These file tools never access an SSH host. Remote files must use the attached terminal.
-        Use edit and write for local file changes; each change has its own native diff approval and stale-file check. Automatic query approval never approves file changes.
+        Use edit and write for local file changes; the native host prepares the exact diff and checks for stale files. It reviews each change manually or through the user's selected automatic approval reviewer. Automatic query approval alone never approves file changes.
         Every run executes visibly in that attached shell and directory, on its connected host.
         Automatically approved metadata queries invoke a verified system executable with literal arguments; they do not use aliases, functions or PATH replacements. Individually reviewed commands retain their original shell behavior.
         The terminal's reported directory is \(terminalDirectory). Do not assume its host is local.
         Pi's local working directory (\(workingDirectory)) belongs only to the agent connection process, not the command target.
         Commands require an empty integrated shell prompt. Auto-approve queries only waives approval for native-verified read-only metadata queries in a direct local, non-root shell.
-        Writes, privilege changes, scripts, compound or unknown commands, SSH and nested/root shells require individual native approval. Never label, split or rewrite commands to bypass review.
+        Without the optional automatic approval reviewer, writes, privilege changes, scripts, compound or unknown commands, SSH and nested/root shells require individual native approval. With that reviewer selected, native approval depends on the full action, actual user request, risk and target evidence. Never label, split or rewrite commands to bypass review, or supply an approval or risk flag.
         Reviewing a shell command clears automatic query approval. This setting never bypasses integration or empty-prompt checks.
         If SSH, su or sudo su opens an unintegrated nested shell, tell the user to use Connect shell and manually paste the setup into that idle shell, or manually exit to its integrated parent. Never offer a grant as a way to bypass missing integration.
         If the terminal cannot execute, explain the blocker and let the user recover it; never switch to another shell or host.
@@ -602,6 +637,11 @@ final class TerminalAIModel: ObservableObject {
             return
         }
         let inputID = UUID().uuidString
+        reviewUserMessages.append(text)
+        cancelApprovalReview(reason: "The user updated the task. Review the action again with the new instructions.")
+        if terminalRequestID != nil, ownedTerminalSequence == nil {
+            cancelTerminalRequest(reason: "The user updated the task before command dispatch. Request a new review.", interrupt: false)
+        }
         pendingInputs.append(Input(id: inputID, text: text, wire: text, displayed: false, mode: deliveryMode))
         prompt = ""
         do {
@@ -965,6 +1005,7 @@ final class TerminalAIModel: ObservableObject {
         environment["PI_CODING_AGENT_DIR"] = agentDirectory.path
         environment["GHOSTTY_AI_WORKSPACE"] = workingDirectory
         environment["GHOSTTY_AI_MODE"] = mode.rawValue
+        environment["GHOSTTY_AI_GUARDIAN"] = isAutomaticReviewEnabled ? "true" : nil
         environment["GHOSTTY_AI_TRUSTED_EXTENSIONS"] = trustedExtensions ? "true" : nil
         environment["GHOSTTY_AI_TRUSTED_EXTENSION_PATHS"] = trustedExtensions ?
             String(data: try JSONSerialization.data(withJSONObject: plugins.flatMap(\.extensionPaths)), encoding: .utf8) : nil
@@ -994,10 +1035,11 @@ final class TerminalAIModel: ObservableObject {
                 try TerminalAIPluginCatalog.scan(agentDirectory: directory)
             }.value
             guard pluginScanID == token else { return }
-            availablePlugins = plugins
+            availablePlugins = withBuiltinPlugins(plugins)
         } catch {
             guard pluginScanID == token else { return }
             pluginScanError = error.localizedDescription
+            availablePlugins = withBuiltinPlugins([])
         }
         if pluginScanID == token { pluginsLoading = false }
     }
@@ -1023,9 +1065,22 @@ final class TerminalAIModel: ObservableObject {
         closeConnection()
     }
 
+    func disableAutomaticReview() {
+        guard !isRunning, !commandEntryBusy else { return }
+        setPluginEnabled(TerminalAIPluginCatalog.builtinGuardian(root: builtinPluginDirectory), enabled: false)
+    }
+
+    private func withBuiltinPlugins(_ plugins: [TerminalAIPlugin]) -> [TerminalAIPlugin] {
+        guard FileManager.default.fileExists(atPath: builtinPluginDirectory.path) ||
+                enabledPluginIDs.contains(TerminalAIPluginCatalog.builtinGuardianID) else { return plugins }
+        return ([TerminalAIPluginCatalog.builtinGuardian(root: builtinPluginDirectory)] + plugins).sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
     private func selectedPlugins() throws -> [TerminalAIPlugin] {
         guard mode == .assistant, !enabledPluginIDs.isEmpty else { return [] }
-        let installed = try TerminalAIPluginCatalog.scan(agentDirectory: URL(fileURLWithPath: pluginsDirectory, isDirectory: true))
+        let installed = withBuiltinPlugins(try TerminalAIPluginCatalog.scan(agentDirectory: URL(fileURLWithPath: pluginsDirectory, isDirectory: true)))
         let selected = installed.filter { enabledPluginIDs.contains($0.id) }
         guard Set(selected.map(\.id)) == enabledPluginIDs else {
             throw terminalError("An enabled Pi plugin is missing. Open Pi plugins settings, refresh the list, and disable the missing selection.")
@@ -1096,6 +1151,7 @@ final class TerminalAIModel: ObservableObject {
     }
 
     private func closeConnection() {
+        cancelApprovalReview(reason: "The agent connection closed during automatic review.")
         cancelExternalOperation(reason: "The agent connection closed before the external result was confirmed.")
         cancelTerminalRequest(reason: "The agent connection closed; command result is unknown.", interrupt: true)
         generation = UUID()
@@ -1104,6 +1160,7 @@ final class TerminalAIModel: ObservableObject {
         retiringConnections.removeAll { $0.hasExited }
         connection = nil
         ready = false
+        guardianReady = false
         requests = [:]
         extensionCompletionRequests = []
         pendingPrompt = nil
@@ -1111,6 +1168,7 @@ final class TerminalAIModel: ObservableObject {
     }
 
     private func finish(persist: Bool = true) {
+        cancelApprovalReview(reason: "The task ended during automatic review.")
         cancelExternalOperation(reason: "The task ended before the external result was confirmed.")
         cancelTerminalRequest(reason: "The agent task ended before the terminal result arrived.", interrupt: true)
         terminalControlAllowed = false
@@ -1263,6 +1321,9 @@ extension TerminalAIModel {
                             "readiness": issue ?? "Ready", "canRun": issue == nil,
                             "hostKnown": host != nil, "shellIntegrated": value["shellIntegrated"] as? Bool ?? false,
                             "canSetupShell": setupAvailable]
+        if let pendingReview, currentTerminalTarget() != pendingReview.terminalTarget {
+            cancelApprovalReview(reason: "The terminal target changed during review. Request a new review for the current shell.")
+        }
         if let old = reportedHost, let host, old != host {
             terminalControlAllowed = false
             respondToApproval(allow: false)
@@ -1481,7 +1542,7 @@ extension TerminalAIModel {
         do {
             switch kind {
             case "file":
-                guard fileRequestID == nil, pendingFileApproval == nil,
+                guard fileRequestID == nil, pendingFileApproval == nil, pendingReview == nil,
                       let path = payload["path"] as? String else { throw terminalError("Another file change is pending or its path is missing.") }
                 let access = try TerminalAIFileAccess(directory: workingDirectory)
                 switch payload["operation"] as? String {
@@ -1505,10 +1566,16 @@ extension TerminalAIModel {
                         do {
                             let write = try await access.prepareWrite(path: path, content: content, expectedSHA256: payload["originalSHA256"] as? String)
                             guard self.generation == token, self.fileRequestID == id, self.isRunning, !self.stopping, !Task.isCancelled else { return }
-                            self.respondToApproval(allow: false)
-                            self.pendingFileApproval = (id, access, write)
-                            self.approval = PendingApproval(id: id, title: "Review local file change", message: "Apply this exact change to the local workspace?", target: "This Mac", path: write.path, preview: write.preview)
-                            self.setPhase(.waitingApproval, "Waiting for file approval")
+                            let operation = ReviewOperation.file(id: id, access: access, write: write)
+                            let action = TerminalAIApprovalReview.Action.file(
+                                path: write.path, diff: write.preview,
+                                contentSHA256: TerminalAIApprovalReview.sha256(Data(content.utf8)),
+                                originalSHA256: payload["originalSHA256"] as? String)
+                            if !self.beginApprovalReview(operation: operation, action: action,
+                                                         narrowScopeEvidence: "Native path and original-content checks restrict this change to one file in the local workspace: \(write.root).") {
+                                self.presentManualReview(operation, reason: self.isAutomaticReviewEnabled ?
+                                                         "Automatic review is unavailable. Review this exact file change." : nil)
+                            }
                         } catch {
                             guard self.generation == token, self.fileRequestID == id else { return }
                             self.fileRequestID = nil
@@ -1591,6 +1658,7 @@ extension TerminalAIModel {
     }
 
     private func cancelFileOperation(reason: String) {
+        if case .file = pendingReview?.operation { cancelApprovalReview(reason: reason) }
         guard let id = fileRequestID else { return }
         fileRequestID = nil
         fileTask?.cancel()
@@ -1769,6 +1837,16 @@ extension TerminalAIModel {
         switch record["type"] as? String {
         case "response":
             guard let id = record["id"] as? String, let command = requests.removeValue(forKey: id) else { return }
+            if command == "guardian_review" {
+                if reviewPromptID == id {
+                    reviewPromptID = nil
+                    if record["success"] as? Bool != true ||
+                        (record["data"] as? [String: Any])?["disposition"] as? String != "handled" {
+                        completeApprovalReview(.ask("The automatic reviewer could not handle this action."))
+                    }
+                }
+                return
+            }
             if record["success"] as? Bool == false {
                 if prompt.isEmpty, let input = pendingInputs.first(where: { $0.requestID == id }) { prompt = input.text }
                 fail(record["error"] as? String ?? "Pi rejected the request.")
@@ -1996,6 +2074,11 @@ extension TerminalAIModel {
         guard let id = record["id"] as? String else { return }
         switch record["method"] as? String {
         case "setStatus":
+            if isRunning, isAutomaticReviewEnabled, record["statusKey"] as? String == "ghostty-guardian",
+               record["statusText"] as? String == "ready" {
+                guardianReady = true
+                return
+            }
             guard isRunning, record["statusKey"] as? String == "ghostty-policy", record["statusText"] as? String == "ready" else { return }
             ready = true
             do {
@@ -2018,6 +2101,14 @@ extension TerminalAIModel {
                     self.activity(.thinking, "Thinking")
                 }
             }
+        case "input" where record["title"] as? String == "ghostty-approval-review-v1":
+            guard let pending = pendingReview,
+                  TerminalAIApprovalReview.hasMatchingIdentity(record["placeholder"] as? String, for: pending.request) else {
+                sendTerminalResult(id: id, value: ["error": "This approval review has expired."])
+                return
+            }
+            let decision = TerminalAIApprovalReview.verify(record["placeholder"] as? String, for: pending.request)
+            completeApprovalReview(decision, responseID: id)
         case "input" where record["title"] as? String == "ghostty-terminal-v1": receiveTerminalRequest(record)
         case "input" where record["title"] as? String == "ghostty-task-plan-v1": receiveWorkbenchRequest(record, kind: "plan")
         case "input" where record["title"] as? String == "ghostty-context-v1": receiveWorkbenchRequest(record, kind: "context")
@@ -2040,7 +2131,7 @@ extension TerminalAIModel {
             sendTerminalResult(id: id, value: ["error": "The agent task is not active."])
             return
         }
-        guard terminalRequestID == nil, pendingTerminalApproval == nil else {
+        guard terminalRequestID == nil, pendingTerminalApproval == nil, pendingReview == nil else {
             sendTerminalResult(id: id, value: ["error": "Another terminal operation is pending."])
             return
         }
@@ -2089,25 +2180,146 @@ extension TerminalAIModel {
                 startTerminalRequest(id: id, payload: payload, authorization: .query(target, identity, assessment))
                 return
             }
-            let reviewReason = !assessment.isReadOnly ? assessment.reason :
+            let reviewReason = isAutomaticReviewEnabled ? "The automatic reviewer is unavailable. Review this exact command." :
+                !assessment.isReadOnly ? assessment.reason :
                 terminalControlAllowed ? "Automatic approval requires a verified direct local, non-root shell with an empty integrated prompt. SSH, root, nested and unknown shells require review." :
                     "Automatic query approval is off. Review this exact command."
+            let operation = ReviewOperation.terminal(id: id, payload: payload, target: target)
+            if !beginApprovalReview(operation: operation,
+                                    action: .terminal(command: command, reason: reason, timeoutSeconds: timeout)) {
+                presentManualReview(operation, reason: reviewReason)
+            }
+            return
+        }
+        startTerminalRequest(id: id, payload: payload)
+    }
+
+    private func beginApprovalReview(
+        operation: ReviewOperation, action: TerminalAIApprovalReview.Action, narrowScopeEvidence: String? = nil
+    ) -> Bool {
+        guard isAutomaticReviewEnabled, guardianReady, pendingReview == nil, isRunning, !stopping else { return false }
+        let terminalTarget = currentTerminalTarget()
+        let workspace = URL(fileURLWithPath: workingDirectory).resolvingSymlinksInPath().path
+        let target: TerminalAIApprovalReview.Target
+        switch operation {
+        case .terminal:
+            target = .init(surfaceID: terminalTarget.surfaceID?.uuidString, host: terminalTarget.host,
+                           directory: terminalTarget.directory, taskID: taskPlan?.id.uuidString)
+        case .file:
+            target = .init(host: "This Mac", directory: workspace, taskID: taskPlan?.id.uuidString)
+        }
+        do {
+            let request = try TerminalAIApprovalReview.Request(
+                context: .init(userMessages: reviewUserMessages, target: target), action: action,
+                generation: generation.uuidString, narrowScopeEvidence: narrowScopeEvidence)
+            let argument = try request.base64Argument()
             respondToApproval(allow: false)
+            pendingReview = PendingReview(request: request, operation: operation, terminalTarget: terminalTarget, workspace: workspace)
+            activity(.executing, "Automatically reviewing \(action.kind == .terminal ? "terminal command" : "file change")")
+            let rpcID = UUID().uuidString
+            reviewPromptID = rpcID
+            requests[rpcID] = "guardian_review"
+            // Private extension commands run while the original tool waits for UI.
+            // They must not enter pendingInputs or the main prompt timeout/finish path.
+            try send(["type": "prompt", "id": rpcID, "message": "/_ghostty_guardian_review \(argument)"])
+            reviewTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled, let self, self.pendingReview?.request.reviewId == request.reviewId else { return }
+                self.completeApprovalReview(.ask("The automatic approval review timed out."))
+            }
+            return true
+        } catch {
+            if pendingReview != nil {
+                completeApprovalReview(.ask("The automatic reviewer is unavailable: \(error.localizedDescription)"))
+                return true
+            }
+            return false
+        }
+    }
+
+    private func takeApprovalReview() -> PendingReview? {
+        let pending = pendingReview
+        pendingReview = nil
+        reviewTimeoutTask?.cancel()
+        reviewTimeoutTask = nil
+        if let reviewPromptID { requests.removeValue(forKey: reviewPromptID) }
+        reviewPromptID = nil
+        return pending
+    }
+
+    private func completeApprovalReview(_ decision: TerminalAIApprovalReview.Decision, responseID: String? = nil) {
+        guard let pending = takeApprovalReview() else { return }
+        if let responseID {
+            sendTerminalResult(id: responseID, value: ["output": "Approval review received."])
+        }
+        guard isRunning, !stopping, isAutomaticReviewEnabled, generation.uuidString == pending.request.generation,
+              currentTerminalTarget() == pending.terminalTarget,
+              URL(fileURLWithPath: workingDirectory).resolvingSymlinksInPath().path == pending.workspace else {
+            rejectReviewedOperation(pending.operation, reason: "The task or target changed during review. Request a new review.")
+            return
+        }
+        switch decision {
+        case .ask(let reason): presentManualReview(pending.operation, reason: reason)
+        case .deny(let assessment):
+            recordApprovalReview(assessment, allowed: false)
+            rejectReviewedOperation(pending.operation, reason: "Automatic review denied this action (\(assessment.riskLevel.rawValue)): \(assessment.rationale)")
+        case .approve(let assessment):
+            recordApprovalReview(assessment, allowed: true)
+            terminalControlAllowed = false
+            switch pending.operation {
+            case .terminal(let id, let payload, let target):
+                startTerminalRequest(id: id, payload: payload, authorization: .reviewed(target))
+            case .file(let id, let access, let write):
+                fileRequestID = nil
+                do {
+                    guard pending.workspace == write.root else { throw terminalError("The local workspace changed. Review the file again.") }
+                    sendTerminalResult(id: id, value: try access.apply(write))
+                } catch { sendTerminalResult(id: id, value: ["error": error.localizedDescription]) }
+                if !stopping { activity(.thinking, "Thinking") }
+            }
+        }
+    }
+
+    private func recordApprovalReview(_ assessment: TerminalAIApprovalReview.Assessment, allowed: Bool) {
+        receivePluginMessage(["role": "custom", "customType": "Codex Guardian", "display": true,
+                              "timestamp": UUID().uuidString,
+                              "content": "\(allowed ? "Allowed" : "Denied") · \(assessment.riskLevel.rawValue) risk\n\(assessment.rationale)"])
+    }
+
+    private func cancelApprovalReview(reason: String) {
+        guard let pending = takeApprovalReview() else { return }
+        rejectReviewedOperation(pending.operation, reason: reason)
+    }
+
+    private func rejectReviewedOperation(_ operation: ReviewOperation, reason: String) {
+        if case .file = operation { fileRequestID = nil }
+        sendTerminalResult(id: operation.id, value: ["error": reason])
+        if isRunning && !stopping { activity(.thinking, "Thinking") }
+    }
+
+    private func presentManualReview(_ operation: ReviewOperation, reason: String? = nil) {
+        respondToApproval(allow: false)
+        switch operation {
+        case .terminal(let id, let payload, let target):
             pendingTerminalApproval = (payload, target)
             approval = PendingApproval(id: id, title: "Review terminal command", message: """
-            \(reason)
+            \(payload["reason"] as? String ?? "")
 
-            Approval required: \(reviewReason)
+            Approval required: \(reason ?? "Review this exact command.")
             Terminal: \(terminalSurface?.title ?? "Attached terminal")
             Reported host: \(target.host)
             Reported directory: \(target.directory)
 
-            \(command)
+            \(payload["command"] as? String ?? "")
             """)
             setPhase(.waitingApproval, "Waiting for terminal approval")
-            return
+        case .file(let id, let access, let write):
+            pendingFileApproval = (id, access, write)
+            approval = PendingApproval(id: id, title: "Review local file change",
+                                       message: reason ?? "Apply this exact change to the local workspace?",
+                                       target: "This Mac", path: write.path, preview: write.preview)
+            setPhase(.waitingApproval, "Waiting for file approval")
         }
-        startTerminalRequest(id: id, payload: payload)
     }
 
     private func currentTerminalTarget() -> TerminalTarget {
@@ -2140,7 +2352,8 @@ extension TerminalAIModel {
         let token = generation
         activity(.executing, payload["operation"] as? String == "read" ? "Reading terminal" : "Running in terminal")
         terminalTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.generation == token, self.terminalRequestID == id,
+                  self.isRunning, !self.stopping, !Task.isCancelled else { return }
             let result: [String: Any]
             do {
                 if payload["operation"] as? String == "run" { try self.validateRun(payload, authorization: authorization) }
@@ -2320,6 +2533,7 @@ extension TerminalAIModel {
     }
 
     private func cancelTerminalRequest(reason: String, interrupt: Bool) {
+        if case .terminal = pendingReview?.operation { cancelApprovalReview(reason: reason) }
         if let approval, pendingTerminalApproval != nil {
             pendingTerminalApproval = nil
             self.approval = nil

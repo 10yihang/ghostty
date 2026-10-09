@@ -206,7 +206,8 @@ async function nativeTerminalKeyPolicy() {
 test("terminal guidance never presents an approval grant as nested-shell recovery", () => {
   const description = tools.get("ghostty_terminal").description;
   assert.match(description, /grant only permits native-verified local read-only queries in a non-root shell/i);
-  assert.match(description, /SSH and root shells always require separate native approval/i);
+  assert.match(description, /SSH and root shells require native review/i);
+  assert.match(description, /without it these actions need individual human approval/i);
   assert.match(description, /native host decides eligibility/i);
   assert.match(description, /split\/rewrite commands to avoid approval/i);
   assert.match(description, /Approving a reviewed shell command clears automatic query approval/i);

@@ -226,7 +226,8 @@ private final class PluginPresentationFixture {
         records = PluginPresentationRecords()
         let records = self.records
         model = TerminalAIModel(defaults: defaults, sendCommand: { records.commands.append($0) },
-                                configurationDirectory: directory.appendingPathComponent("ghostty-ai"))
+                                configurationDirectory: directory.appendingPathComponent("ghostty-ai"),
+                                builtinPluginDirectory: directory.appendingPathComponent("absent-builtin"))
         host = NSHostingView(rootView: TerminalAIView(model: model, placement: .constant(placement), onClose: {}))
         host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(x: 0, y: 0, width: 1_000, height: 700)

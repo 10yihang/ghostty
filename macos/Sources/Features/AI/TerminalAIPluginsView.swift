@@ -120,8 +120,7 @@ struct TerminalAIPluginsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(plugin.unavailableReason == nil ? "Trust \(plugin.name)?" : "\(plugin.name) is unavailable")
                 .font(.headline)
-            Text(plugin.unavailableReason ??
-                 "\(plugin.name) can run code on This Mac with your user permissions, including while your terminal is connected over SSH. Enable it only if you trust this plugin. It will be used for the next task.")
+            Text(plugin.unavailableReason ?? trustMessage(for: plugin))
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -134,7 +133,7 @@ struct TerminalAIPluginsView: View {
                     Button("Cancel") { pendingPlugin = nil }
                         .keyboardShortcut(.cancelAction)
                         .accessibilityIdentifier("pi-plugin-confirmation-cancel")
-                    Button("Trust and enable") {
+                    Button(plugin.id == TerminalAIPluginCatalog.builtinGuardianID ? "Enable AI automatic approval" : "Trust and enable") {
                         guard !selectionLocked else { return }
                         model.setPluginEnabled(plugin, enabled: true)
                         pendingPlugin = nil
@@ -150,6 +149,13 @@ struct TerminalAIPluginsView: View {
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("pi-plugin-confirmation")
+    }
+
+    private func trustMessage(for plugin: TerminalAIPlugin) -> String {
+        if plugin.id == TerminalAIPluginCatalog.builtinGuardianID {
+            return "Codex Guardian uses Codex's open-source policy with your current Pi model to review proposed commands, file changes, and their task context. The AI reviewer can approve terminal commands and changes to files in the local workspace without asking you each time. Commands still run visibly in your attached terminal, including its SSH host, and require a verified empty prompt. Enable this authority only if you trust the reviewer. You can turn it off when the task is idle. Changes apply to the next task."
+        }
+        return "\(plugin.name) can run code on This Mac with your user permissions, including while your terminal is connected over SSH. Enable it only if you trust this plugin. It will be used for the next task."
     }
 
     private var emptyState: some View {
@@ -183,6 +189,9 @@ struct TerminalAIPluginsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text(plugin.name).fontWeight(.medium).lineLimit(1)
+                        if plugin.id == TerminalAIPluginCatalog.builtinGuardianID {
+                            Text("Built-in").font(.caption).foregroundStyle(.secondary)
+                        }
                         if !plugin.version.isEmpty {
                             Text(plugin.version).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }

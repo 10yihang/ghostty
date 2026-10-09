@@ -134,7 +134,7 @@ jobs:
           npm --prefix macos/AIChat ci
           npm --prefix macos/AIChat run typecheck
           npm --prefix macos/AIChat test
-          node --test macos/Tests/AI/TerminalAIPolicy.test.mjs macos/Tests/AI/TerminalAINativeMCP.test.mjs
+          node --test macos/Tests/AI/TerminalAIPolicy.test.mjs macos/Tests/AI/TerminalAINativeMCP.test.mjs macos/Tests/AI/TerminalAIGuardianPlugin.test.mjs
           python3 -m unittest discover -s .github/scripts -p 'test_fork_*.py' -v
       - name: Install Xcode Metal components
         run: |
