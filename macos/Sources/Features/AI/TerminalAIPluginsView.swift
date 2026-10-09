@@ -4,8 +4,7 @@ struct TerminalAIPluginsView: View {
     @ObservedObject var model: TerminalAIModel
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
-    @State private var presentedPlugin: TerminalAIPlugin?
-    @State private var pluginAlertPresented = false
+    @State private var pendingPlugin: TerminalAIPlugin?
 
     private var selectionLocked: Bool { model.isRunning || model.commandEntryBusy }
 
@@ -32,11 +31,16 @@ struct TerminalAIPluginsView: View {
                     .disabled(model.pluginsLoading)
                 Button("Disable all", action: model.disableAllPlugins)
                     .disabled(selectionLocked || model.enabledPluginIDs.isEmpty)
-                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(pendingPlugin == nil ? .cancelAction : nil)
             }
             Text("Selected plugins run on This Mac with your user permissions. Enable only plugins you trust. Changes apply to the next task.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let plugin = pendingPlugin {
+                confirmation(for: plugin)
+            }
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -110,29 +114,42 @@ struct TerminalAIPluginsView: View {
         .frame(width: 560, height: 620)
         .background(Color(nsColor: .windowBackgroundColor))
         .task { await model.refreshPlugins() }
-        .alert(alertTitle, isPresented: $pluginAlertPresented, presenting: presentedPlugin) { plugin in
-            if plugin.unavailableReason != nil {
-                Button("Close", role: .cancel) {}
-            } else {
-                Button("Cancel", role: .cancel) {}.keyboardShortcut(.defaultAction)
-                Button("Trust and enable") {
-                    guard !selectionLocked else { return }
-                    model.setPluginEnabled(plugin, enabled: true)
-                }
-                .disabled(selectionLocked)
-            }
-        } message: { plugin in
-            if let reason = plugin.unavailableReason {
-                Text(reason)
-            } else {
-                Text("\(plugin.name) can run code on This Mac with your user permissions, including while your terminal is connected over SSH. Enable it only if you trust this plugin. It will be used for the next task.")
-            }
-        }
     }
 
-    private var alertTitle: String {
-        guard let plugin = presentedPlugin else { return "Enable plugin?" }
-        return plugin.unavailableReason == nil ? "Trust \(plugin.name)?" : "\(plugin.name) is unavailable"
+    private func confirmation(for plugin: TerminalAIPlugin) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(plugin.unavailableReason == nil ? "Trust \(plugin.name)?" : "\(plugin.name) is unavailable")
+                .font(.headline)
+            Text(plugin.unavailableReason ??
+                 "\(plugin.name) can run code on This Mac with your user permissions, including while your terminal is connected over SSH. Enable it only if you trust this plugin. It will be used for the next task.")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                if plugin.unavailableReason != nil {
+                    Button("Close") { pendingPlugin = nil }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityIdentifier("pi-plugin-compatibility-close")
+                } else {
+                    Button("Cancel") { pendingPlugin = nil }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityIdentifier("pi-plugin-confirmation-cancel")
+                    Button("Trust and enable") {
+                        guard !selectionLocked else { return }
+                        model.setPluginEnabled(plugin, enabled: true)
+                        pendingPlugin = nil
+                    }
+                    .disabled(selectionLocked)
+                    .accessibilityIdentifier("pi-plugin-confirmation-enable")
+                }
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("pi-plugin-confirmation")
     }
 
     private var emptyState: some View {
@@ -216,8 +233,7 @@ struct TerminalAIPluginsView: View {
         if !enabled {
             model.setPluginEnabled(plugin, enabled: false)
         } else {
-            presentedPlugin = plugin
-            pluginAlertPresented = true
+            pendingPlugin = plugin
         }
     }
 

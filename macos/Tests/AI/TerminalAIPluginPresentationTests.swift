@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Testing
+import Vision
 @testable import Ghostty
 
 @Suite(.serialized)
@@ -27,6 +28,79 @@ struct TerminalAIPluginPresentationTests {
         #expect(fixture.settingsPopover == nil)
         #expect(fixture.sentCommands.isEmpty)
     }
+
+    @Test func pluginSwitchesShowInlineTrustAndCompatibilityAndPersistOnlyApproval() async throws {
+        let fixture = try PluginPresentationFixture(placement: .right, packages: ["fixture-plugin", "pi-cc-extensions"])
+        defer { fixture.close() }
+        try await fixture.openSettings()
+        try await fixture.openPlugins()
+        try await fixture.wait("The controlled plugin catalog did not finish loading") {
+            fixture.model.availablePlugins.count == 2 && !fixture.model.pluginsLoading && fixture.pluginSwitches.count == 2
+        }
+        let normal = try #require(fixture.model.availablePlugins.first { $0.name == "fixture-plugin" })
+        let unavailable = try #require(fixture.model.availablePlugins.first { $0.name == "pi-cc-extensions" })
+        let picker = try #require(fixture.pluginSheet)
+        let windows = fixture.visibleWindowNumbers
+        #expect(fixture.model.enabledPluginIDs.isEmpty)
+        for control in fixture.pluginSwitches { #expect(control.isEnabled) }
+
+        try fixture.clickPluginSwitch(0)
+        try await fixture.wait("Clicking the real plugin switch did not present Trust and enable") {
+            try fixture.inlineActionFrame("Trust and enable") != nil
+        }
+        #expect(fixture.model.enabledPluginIDs.isEmpty)
+        #expect(fixture.visibleWindowNumbers == windows)
+        #expect(fixture.pluginSheet === picker)
+        try fixture.preview("trust-inline", view: try #require(fixture.pluginSheet?.contentView))
+        try fixture.clickInlineAction("Cancel")
+        try await fixture.wait("Cancel did not leave the plugin switch off") {
+            try fixture.inlineActionFrame("Trust and enable") == nil && fixture.pluginSwitches.first?.state == .off
+        }
+        #expect(fixture.model.enabledPluginIDs.isEmpty)
+        #expect(fixture.pluginSheet === picker && picker.isVisible)
+
+        try fixture.clickPluginSwitch(0)
+        try await fixture.wait("The inline trust confirmation could not be reopened") { try fixture.inlineActionFrame("Trust and enable") != nil }
+        try fixture.clickInlineAction("Trust and enable")
+        try await fixture.wait("Trust and enable did not turn on the real plugin switch") {
+            fixture.model.enabledPluginIDs == [normal.id] && fixture.pluginSwitches.first?.state == .on
+        }
+        #expect(fixture.defaults.stringArray(forKey: "terminalAI.enabledPluginIDs") == [normal.id])
+
+        try fixture.clickPluginSwitch(1)
+        try await fixture.wait("The unavailable plugin switch did not explain its limitation") { try fixture.inlineActionFrame("Close") != nil }
+        #expect(fixture.visibleWindowNumbers == windows)
+        try fixture.preview("unavailable-inline", view: try #require(fixture.pluginSheet?.contentView))
+        #expect(try fixture.inlineActionFrame("Trust and enable") == nil)
+        #expect(!fixture.model.enabledPluginIDs.contains(unavailable.id))
+        try fixture.clickInlineAction("Close")
+        try await fixture.wait("The unavailable plugin switch did not stay off") {
+            try fixture.inlineActionFrame("Close") == nil && fixture.pluginSwitches.last?.state == .off
+        }
+        #expect(fixture.defaults.stringArray(forKey: "terminalAI.enabledPluginIDs") == [normal.id])
+        #expect(fixture.pluginSheet === picker && picker.isVisible)
+        #expect(fixture.visibleWindowNumbers == windows)
+        #expect(fixture.sentCommands.isEmpty)
+    }
+
+    @Test func aRunningTaskDisablesSwitchesAndShowsWhy() async throws {
+        let fixture = try PluginPresentationFixture(placement: .right, packages: ["fixture-plugin"])
+        defer { fixture.model.stop(); fixture.close() }
+        fixture.model.present(surfaceID: UUID(), directory: fixture.directory.path, selection: nil)
+        fixture.model.prompt = "Controlled UI task"
+        fixture.model.submit()
+        #expect(fixture.model.isRunning)
+        try await fixture.openSettings()
+        try await fixture.openPlugins()
+        try await fixture.wait("The disabled plugin switch and explanation did not render") {
+            try fixture.renders("Wait for the current task") && fixture.pluginSwitches.count == 1
+        }
+        #expect(fixture.pluginSwitches.first?.isEnabled == false)
+        #expect(try fixture.inlineActionFrame("Trust and enable") == nil)
+        fixture.model.stop()
+        try await fixture.wait("Finishing the task did not unlock the plugin switch") { fixture.pluginSwitches.first?.isEnabled == true }
+    }
+
 }
 
 /// All input stays inside this test's window. There is no terminal, Pi process,
@@ -58,10 +132,89 @@ private final class PluginPresentationFixture {
         }
     }
 
-    init(placement: TerminalAIPlacement) throws {
+    var pluginSwitches: [NSSwitch] {
+        guard let content = pluginSheet?.contentView else { return [] }
+        return descendants(content).compactMap { $0 as? NSSwitch }.sorted {
+            $0.convert($0.bounds, to: nil).midY > $1.convert($1.bounds, to: nil).midY
+        }
+    }
+
+    var visibleWindowNumbers: Set<Int> {
+        Set(NSApp.windows.filter { candidate in
+            guard candidate.isVisible else { return false }
+            var owner: NSWindow? = candidate
+            while let current = owner {
+                if current === window || ownedPopovers.contains(where: { $0 === current }) { return true }
+                owner = current.sheetParent ?? current.parent
+            }
+            return false
+        }.map(\.windowNumber))
+    }
+
+    func clickPluginSwitch(_ index: Int) throws {
+        let control = try #require(pluginSwitches.indices.contains(index) ? pluginSwitches[index] : nil)
+        let target = try #require(control.window)
+        target.makeKey()
+        click(target, control.convert(NSPoint(x: control.bounds.midX, y: control.bounds.midY), to: nil), trackingButton: true)
+    }
+
+    // Only controlled English labels in this fixture's own rendered bitmap
+    // enter Vision. No screen, application inventory, or user content is read.
+    private func recognizedText() throws -> [VNRecognizedText] {
+        guard let view = pluginSheet?.contentView else { return [] }
+        view.layoutSubtreeIfNeeded()
+        let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let image = try #require(bitmap.cgImage)
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["en-US"]
+        request.usesLanguageCorrection = false
+        try VNImageRequestHandler(cgImage: image).perform([request])
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first }
+    }
+
+    func inlineActionFrame(_ title: String) throws -> CGRect? {
+        guard let view = pluginSheet?.contentView else { return nil }
+        for candidate in try recognizedText() {
+            guard let range = candidate.string.range(of: title), let observation = try candidate.boundingBox(for: range) else { continue }
+            let box = observation.boundingBox
+            let point = NSPoint(x: view.bounds.minX + box.midX * view.bounds.width,
+                                y: view.bounds.minY + (view.isFlipped ? 1 - box.midY : box.midY) * view.bounds.height)
+            let center = view.convert(point, to: nil)
+            return CGRect(x: center.x - 1, y: center.y - 1, width: 2, height: 2)
+        }
+        return nil
+    }
+
+    func clickInlineAction(_ title: String) throws {
+        let picker = try #require(pluginSheet)
+        let frame = try #require(try inlineActionFrame(title))
+        picker.makeKey()
+        click(picker, NSPoint(x: frame.midX, y: frame.midY))
+    }
+
+    func renders(_ text: String) throws -> Bool {
+        try recognizedText().map(\.string).joined(separator: " ").contains(text)
+    }
+
+    private func descendants(_ view: NSView) -> [NSView] {
+        [view] + view.subviews.flatMap { descendants($0) }
+    }
+
+    init(placement: TerminalAIPlacement, packages: [String] = []) throws {
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ghostty-plugin-presentation-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for name in packages {
+            let package = directory.appendingPathComponent("npm/node_modules/\(name)", isDirectory: true)
+            try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+            let manifest: [String: Any] = ["name": name, "version": "1.0.0", "description": "Controlled UI test metadata",
+                                           "pi": ["extensions": ["index.ts"]]]
+            try JSONSerialization.data(withJSONObject: manifest).write(to: package.appendingPathComponent("package.json"))
+            try Data("throw new Error('UI fixtures must never import plugin code');\n".utf8)
+                .write(to: package.appendingPathComponent("index.ts"))
+        }
         suite = "ghostty-plugin-presentation.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: suite))
         defaults.set(true, forKey: "terminalAI.useExistingPiConfiguration")
@@ -73,8 +226,10 @@ private final class PluginPresentationFixture {
         model = TerminalAIModel(defaults: defaults, sendCommand: { records.commands.append($0) },
                                 configurationDirectory: directory.appendingPathComponent("ghostty-ai"))
         host = NSHostingView(rootView: TerminalAIView(model: model, placement: .constant(placement), onClose: {}))
+        host.appearance = NSAppearance(named: .aqua)
         host.frame = NSRect(x: 0, y: 0, width: 1_000, height: 700)
         window = NSWindow(contentRect: host.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: .aqua)
         window.isReleasedWhenClosed = false
         window.contentView = host
         window.orderFront(nil)
@@ -121,9 +276,9 @@ private final class PluginPresentationFixture {
         target.sendEvent(up)
     }
 
-    func wait(_ message: String, until predicate: () -> Bool) async throws {
+    func wait(_ message: String, until predicate: () throws -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while !predicate() {
+        while try !predicate() {
             guard ContinuousClock.now < deadline else {
                 throw NSError(domain: "PluginPresentationFixture", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
             }
