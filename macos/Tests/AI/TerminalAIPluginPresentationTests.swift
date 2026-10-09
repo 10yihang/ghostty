@@ -92,10 +92,12 @@ struct TerminalAIPluginPresentationTests {
         #expect(fixture.model.isRunning)
         try await fixture.openSettings()
         try await fixture.openPlugins()
-        try await fixture.wait("The disabled plugin switch and explanation did not render") {
-            try fixture.renders("Wait for the current task") && fixture.pluginSwitches.count == 1
+        try await fixture.wait("The controlled plugin catalog did not finish loading") {
+            !fixture.model.pluginsLoading && fixture.pluginSwitches.count == 1
         }
         #expect(fixture.pluginSwitches.first?.isEnabled == false)
+        let renderedText = try fixture.renderedText()
+        #expect(renderedText.contains("Wait for the current task"), "Rendered picker: \(renderedText)")
         #expect(try fixture.inlineActionFrame("Trust and enable") == nil)
         fixture.model.stop()
         fixture.model.receive(["type": "agent_settled"])
@@ -169,7 +171,7 @@ private final class PluginPresentationFixture {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["en-US"]
-        request.usesLanguageCorrection = false
+        request.usesLanguageCorrection = true
         try VNImageRequestHandler(cgImage: image).perform([request])
         return (request.results ?? []).compactMap { $0.topCandidates(1).first }
     }
@@ -194,8 +196,8 @@ private final class PluginPresentationFixture {
         click(picker, NSPoint(x: frame.midX, y: frame.midY))
     }
 
-    func renders(_ text: String) throws -> Bool {
-        try recognizedText().map(\.string).joined(separator: " ").contains(text)
+    func renderedText() throws -> String {
+        try recognizedText().map(\.string).joined(separator: " ")
     }
 
     private func descendants(_ view: NSView) -> [NSView] {
