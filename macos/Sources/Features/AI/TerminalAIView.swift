@@ -42,6 +42,7 @@ struct TerminalAIView: View {
     var onClose: () -> Void
 
     @State private var settingsPresented = false
+    @State private var pluginsPresented = false
     @State private var historyPresented = false
     @State private var chatError: String?
     @State private var webViewID = UUID()
@@ -81,7 +82,13 @@ struct TerminalAIView: View {
         .onExitCommand(perform: onClose)
         .onChange(of: model.conversationID) { _ in chatError = nil }
         .popover(isPresented: $settingsPresented, arrowEdge: .top) {
-            TerminalAISettingsView(model: model)
+            TerminalAISettingsView(model: model, onOpenPlugins: {
+                settingsPresented = false
+                pluginsPresented = true
+            })
+        }
+        .sheet(isPresented: $pluginsPresented) {
+            TerminalAIPluginsView(model: model)
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("AI conversation")
@@ -307,14 +314,14 @@ struct TerminalAIHistoryView: View {
 
 private struct TerminalAISettingsView: View {
     @ObservedObject var model: TerminalAIModel
+    var onOpenPlugins: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var folderError: String?
-    @State private var pluginsPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("AI Settings").font(.headline)
-            Button("Pi plugins…") { pluginsPresented = true }
+            Button("Pi plugins…", action: onOpenPlugins)
             DisclosureGroup("Pi MCP") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Uses the MCP servers enabled in your existing Pi configuration. Pi manages their connections and tools on This Mac.")
@@ -405,9 +412,6 @@ private struct TerminalAISettingsView: View {
         }
         .padding(18)
         .frame(width: 440)
-        .sheet(isPresented: $pluginsPresented) {
-            TerminalAIPluginsView(model: model)
-        }
         .onDisappear { model.saveCredentials() }
     }
 }
