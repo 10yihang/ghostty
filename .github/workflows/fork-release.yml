@@ -127,14 +127,14 @@ jobs:
           version: ${{ steps.zig.outputs.version }}
       - name: Install the pinned Pi test runtime
         run: |
-          npm install --global @earendil-works/pi-coding-agent@0.87.1
+          npm install --global @earendil-works/pi-coding-agent@1.1.0
           printf 'GHOSTTY_PI_PACKAGE=%s/@earendil-works/pi-coding-agent\n' "$(npm root --global)" >> "$GITHUB_ENV"
       - name: Build and verify chat and Pi policies
         run: |
           npm --prefix macos/AIChat ci
           npm --prefix macos/AIChat run typecheck
           npm --prefix macos/AIChat test
-          node --test macos/Tests/AI/TerminalAIPolicy.test.mjs
+          node --test macos/Tests/AI/TerminalAIPolicy.test.mjs macos/Tests/AI/TerminalAINativeMCP.test.mjs
           python3 -m unittest discover -s .github/scripts -p 'test_fork_*.py' -v
       - name: Install Xcode Metal components
         run: |

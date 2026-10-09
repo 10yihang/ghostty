@@ -91,12 +91,51 @@ keybind = super+shift+a=unbind
 keybind = super+shift+i=toggle_ai_panel
 ```
 
+## Pi plugins
+
+Open **AI Settings → Pi plugins…** to choose installed personal Pi packages or
+extensions. The list scans the configured Pi folder's `npm/node_modules` and
+`extensions` directories without importing plugin code. It shows versions,
+descriptions, entry counts, discovery warnings, and known interaction limitations.
+Search filters the list; **Refresh** rescans after installing with Pi.
+
+Plugins are off by default. Enabling one asks for trust once, saves the selection
+in Ghostty preferences, and reconnects for the next task. Selections cannot change
+while an agent or command-entry task is running. Changing the Pi folder clears
+them. **Disable all** also clears selections whose package was uninstalled.
+Ghostty does not modify Pi's package settings or enable project auto-discovery.
+
+Selected extensions, skills, and prompt templates are passed explicitly to Pi.
+The Ghostty extension loads first so its terminal and workspace tools keep their
+definitions. Built-in `bash` and `powershell` stay excluded. The command-entry
+assistant remains proposal-only and does not load selected plugins.
+The assistant explicitly loads Pi's built-in MCP, codemode, and tool-search
+extensions. Tool-selection modifiers add Ghostty's tools without overriding
+Pi's direct/deferred/hidden exposure or enabling its local shell tools. Native
+MCP is available independently of selected plugins; command entry disables it.
+
+Plugins are trusted code running on **This Mac**, with the user's OS permissions;
+they are not sandboxed by the tool allowlist. Their own process/file operations
+do not use the attached SSH shell or Ghostty's native command approval.
+Plugins intended to operate that shell should call `ghostty_terminal` instead.
+The native terminal/file tools retain their existing approval and scope checks.
+
+`pi-cc-extensions` changes Pi's terminal interface. Clicking its switch explains
+that Ghostty uses its own AI panel and keeps it off. `pi-model-manager` similarly
+needs Pi's interactive model-management UI. Other packages may load tools but
+still need UI adaptation: Pi RPC cannot render `ctx.ui.custom()` terminal widgets.
+The picker flags questionnaire, side-question, and session-import limitations.
+Registered commands can report visible custom messages; a handled command that
+leaves Pi idle completes without waiting for an agent event.
+Slash commands are sent directly to Pi, and Pi notifications appear in the chat.
+
 ## Current terminal control
 
 Pi's terminal tools are `ghostty_terminal` (`read` or `run`) and the nonexecuting
 `ghostty_propose_command`. Its other managed tools handle task plans, explicit
-attachments and configured MCP servers. All terminal command execution and diagnostics use the attached
-terminal; no independent local runner is available to the model.
+attachments. Pi's native MCP tools use its configured servers. Terminal commands
+and diagnostics intended for the attached shell use `ghostty_terminal`;
+selected plugins and MCP servers run in their own environments.
 `read` returns the attached
 terminal's visible screen, explicitly marked as possibly including earlier or
 remote output. `run` pastes one complete single-line command into that same shell,
@@ -192,7 +231,7 @@ marked, and context is bounded to 16 items / 256 KiB. `ghostty_context` reads on
 these attached items. Remote readers identify whether they capture a file head,
 log tail, project excerpts or tracked diff, and carry that scope into Pi. The
 8,192-character preview is labeled when shortened; the complete bounded
-attachment remains available to the agent. Loading an MCP resource preserves the draft and pauses
+attachment remains available to the agent. Loading a resource preserves the draft and pauses
 submission until it finishes or is canceled.
 
 **Workflows** saves task prompts with `{{parameter}}` placeholders. Create or edit
@@ -201,14 +240,19 @@ start it. Saving waits for native acknowledgment, so a failed save preserves the
 form. Workflows persist locally and their terminal operations retain ordinary
 approval and current-shell binding.
 
-**AI Settings → MCP tools and resources** configures stdio executables or
-Streamable HTTP endpoints, tests their connection, and lists tools/resources.
-Bearer tokens and configured environment values live in Keychain. The agent can
-discover configured servers; tool calls and resource reads require separate MCP
-approval even when Auto-approve queries is enabled. Resource selection explicitly
-attaches the chosen data. HTTP supports JSON/SSE and negotiated protocol/session
-headers, including 2025-11-25 GET resumption without replaying the tool POST.
-Automatic OAuth sign-in and legacy HTTP+SSE transport are not provided.
+**AI Settings → Pi MCP** reuses enabled servers from the existing Pi configuration
+folder's `mcp.json` (Pi 1.1.0 or newer). **Show connection status** sends `/mcp`
+without replacing an unsent draft; status and failures appear in the chat.
+Manage servers and sign-in with `pi mcp add`, `pi mcp list`, and `pi mcp login`.
+Pi owns stdio/Streamable HTTP connections, authentication, resources, and tool
+exposure. MCP tool events use the same chat cards as other tools. Calls follow
+Pi's configuration and selected permission extensions; Ghostty does not add its
+old separate MCP approval prompt. Native terminal/file checks still apply when
+those tools are called, including from codemode.
+The previous Ghostty MCP settings and `ghostty_mcp` tool are no longer exposed.
+Existing configurations and Keychain entries are retained, without automatic
+credential migration. Enable **Use existing Pi configuration** to reuse personal
+servers; project MCP configuration still follows Pi's project-trust rules.
 
 The workbench shows the terminal's reported host, directory and readiness. These
 are shell claims, not authenticated SSH identity. **Connect shell…** beside an

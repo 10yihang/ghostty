@@ -36,7 +36,164 @@ const context = { cwd: workspace, hasUI: true, ui: { setStatus: () => { ready = 
 await handlers.get("session_start")({}, context);
 
 const fileTools = ["edit", "find", "grep", "ls", "read", "write"];
-const expectedTools = [...fileTools, "ghostty_context", "ghostty_mcp", "ghostty_propose_command", "ghostty_task_plan", "ghostty_terminal"].sort();
+const expectedTools = [...fileTools, "ghostty_context", "ghostty_propose_command", "ghostty_task_plan", "ghostty_terminal"].sort();
+
+async function policyFactory({ trusted = false, command = false } = {}) {
+  const previous = { GHOSTTY_AI_MODE: process.env.GHOSTTY_AI_MODE, GHOSTTY_AI_TRUSTED_EXTENSIONS: process.env.GHOSTTY_AI_TRUSTED_EXTENSIONS, GHOSTTY_AI_TRUSTED_EXTENSION_PATHS: process.env.GHOSTTY_AI_TRUSTED_EXTENSION_PATHS };
+  process.env.GHOSTTY_AI_MODE = command ? "command" : "assistant";
+  process.env.GHOSTTY_AI_TRUSTED_EXTENSIONS = String(trusted);
+  process.env.GHOSTTY_AI_TRUSTED_EXTENSION_PATHS = JSON.stringify(trusted ? ["<inline:selected-fixture>"] : []);
+  try {
+    return (await import(pathToFileURL(path.join(temporary, "policy.mjs")) + `?fixture=${randomUUID()}`)).default;
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+    }
+  }
+}
+
+async function trustedPolicyFixture(options = {}) {
+  const register = await policyFactory(options);
+  const registered = new Map();
+  const events = new Map();
+  const custom = [{ name: "fixture_lookup", sourceInfo: { source: "inline", path: "<inline:selected-fixture>" } },
+    { name: "bash", sourceInfo: { source: "builtin", path: "builtin:bash" } }, { name: "powershell", sourceInfo: { source: "inline", path: "<inline:selected-fixture>" } },
+    { name: "fixture_builtin", sourceInfo: { source: "builtin", path: "builtin:bash" } },
+    { name: "fixture_mcp", sourceInfo: { source: "mcp", path: "builtin:mcp" } },
+    { name: "fixture_foreign", sourceInfo: { source: "inline", path: "<inline:not-selected>" } }, { name: "fixture_unattributed" }];
+  let active;
+  register({
+    on: (name, handler) => events.set(name, handler), registerTool: (tool) => registered.set(tool.name, tool),
+    getAllTools: () => [...registered.values(), ...custom], setActiveTools: (names) => { active = names; },
+  });
+  await events.get("session_start")({}, context);
+  if (options.startTask !== false) events.get("before_agent_start")();
+  return { registered, events, custom, get active() { return active; } };
+}
+
+test("selected trusted extensions enable only registered custom tools and leave plugin results untouched", async () => {
+  const fixture = await trustedPolicyFixture({ trusted: true });
+  assert.deepEqual(fixture.active.sort(), [...expectedTools, "fixture_lookup"].sort());
+  assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }), undefined);
+  for (const toolName of ["unknown_plugin_tool", "bash", "powershell", "fixture_builtin", "fixture_mcp", "fixture_foreign", "fixture_unattributed", "ghostty_mcp"]) {
+    assert.equal(fixture.events.get("tool_call")({ toolName }).block, true);
+  }
+  for (const isError of [false, true]) {
+    const event = { toolName: "fixture_lookup", content: [{ type: "text", text: "original plugin output" }], details: { isError: true, fixture: "metadata" }, isError };
+    const before = structuredClone(event);
+    assert.equal(fixture.events.get("tool_result")(event), undefined);
+    assert.deepEqual(event, before);
+  }
+  assert.equal(fixture.events.get("user_bash")({ command: "pwd" }).result.exitCode, 1);
+  const description = fixture.registered.get("ghostty_terminal").description;
+  assert.match(description, /pi\.exec in a separate local process/);
+  assert.match(description, /not sandboxed or bound to the terminal/);
+  assert.match(description, /real filesystem/);
+  assert.match(description, /native approval rules still apply/);
+});
+
+test("unselected extensions keep native tools and command mode never grants plugin tools", async () => {
+  for (const options of [{ trusted: false }, { trusted: true, command: true }]) {
+    const fixture = await trustedPolicyFixture(options);
+    if (options.command) assert.equal(fixture.active, undefined);
+    else assert.deepEqual(fixture.active.sort(), expectedTools);
+    assert.deepEqual([...fixture.registered.keys()].sort(), options.command ? ["ghostty_propose_command"] : expectedTools);
+    assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true);
+    assert.equal(fixture.events.get("tool_call")({ toolName: "bash" }).block, true);
+    assert.equal(fixture.events.get("user_bash")({ command: "pwd" }).result.exitCode, 1);
+    if (options.command) assert.equal(fixture.events.get("tool_call")({ toolName: "ghostty_terminal" }).block, true);
+  }
+});
+
+test("trusted custom tools share the native task budget and refresh registrations before a task", async () => {
+  const fixture = await trustedPolicyFixture({ trusted: true });
+  fixture.custom.push({ name: "fixture_late_tool", sourceInfo: { source: "inline", path: "<inline:selected-fixture>" } });
+  fixture.events.get("before_agent_start")();
+  assert.ok(fixture.active.includes("fixture_late_tool"));
+  for (let index = 0; index < 40; index++) {
+    assert.equal(fixture.events.get("tool_call")({ toolName: index % 2 ? "fixture_late_tool" : "ghostty_terminal" }), undefined);
+  }
+  assert.deepEqual(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }), {
+    block: true, reason: "The task reached its diagnostic limit. Summarize the evidence and ask the user how to continue.", terminate: true,
+  });
+  fixture.events.get("before_agent_start")();
+  const now = Date.now;
+  try {
+    Date.now = () => now() + 10 * 60 * 1000 + 1;
+    assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).terminate, true);
+  } finally { Date.now = now; }
+});
+
+test("extension commands can call approved tools before the first agent turn starts the budget", async () => {
+  for (const trusted of [false, true]) {
+    const fixture = await trustedPolicyFixture({ trusted, startTask: false });
+    assert.equal(fixture.events.get("tool_call")({ toolName: "unknown_tool" }).block, true);
+    assert.equal(fixture.events.get("tool_call")({ toolName: "ghostty_terminal" }), undefined);
+    if (trusted) assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }), undefined);
+    else assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true);
+  }
+});
+
+test("Pi SDK preserves Ghostty registrations first and admits custom tools only through a matching CLI allowlist", async () => {
+  const sdk = await import(pathToFileURL(path.join(packagePath, "dist/index.js")));
+  const { Agent } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-agent-core/dist/index.js")));
+  const { loadExtensionFromFactory } = await import(pathToFileURL(path.join(packagePath, "dist/core/extensions/loader.js")));
+  for (const options of [{ trusted: true, allowed: ["*"] }, { trusted: true, allowed: expectedTools },
+    { trusted: false, allowed: expectedTools }, { trusted: true, command: true, allowed: ["ghostty_propose_command"] }]) {
+    const runtime = sdk.createExtensionRuntime();
+    const eventBus = sdk.createEventBus();
+    const ghostty = await loadExtensionFromFactory(await policyFactory(options), workspace, eventBus, runtime, "<inline:ghostty>");
+    const fixture = await loadExtensionFromFactory((pi) => {
+      for (const name of [...expectedTools, "bash", "powershell", "fixture_lookup"]) pi.registerTool({
+        name, label: name, description: "Fixture replacement must not take over Ghostty tools.", parameters: { type: "object", properties: {} }, defaultActive: false,
+        execute: async () => ({ content: [{ type: "text", text: "fixture plugin result" }], details: { fixture: true } }),
+      });
+    }, workspace, eventBus, runtime, "<inline:selected-fixture>");
+    const extensions = { extensions: [ghostty, fixture], runtime, errors: [], warnings: [] };
+    const parsed = sdk.parseArgs(["--no-extensions", "--no-builtin-tools", "--extension", "ghostty-tools.mjs", "--extension", "selected-fixture.mjs",
+      "--tools", options.allowed.join(","), "--exclude-tools", "bash,powershell"]);
+    assert.equal(parsed.noExtensions, true);
+    assert.equal(parsed.noBuiltinTools, true);
+    assert.deepEqual(parsed.extensions, ["ghostty-tools.mjs", "selected-fixture.mjs"]);
+    const empty = () => ({ skills: [], prompts: [], themes: [], agentsFiles: [], diagnostics: [] });
+    // Every resource and session lives in memory; no real settings, history,
+    // credentials, selected plugins, providers or network requests are loaded.
+    const session = new sdk.AgentSession({
+      agent: new Agent({ streamFn: () => { throw new Error("This fixture must never request a model."); } }),
+      cwd: workspace, sessionManager: sdk.SessionManager.inMemory(workspace), settingsManager: sdk.SettingsManager.inMemory(), modelRuntime: {},
+      allowedToolNames: parsed.tools, excludedToolNames: parsed.excludeTools, initialActiveToolNames: parsed.tools,
+      resourceLoader: { getExtensions: () => extensions, getSkills: empty, getPrompts: empty, getThemes: empty, getAgentsFiles: empty,
+        getSystemPrompt: () => "Isolated registry fixture.", getAppendSystemPrompt: () => [], extendResources() {}, async reload() {} },
+    });
+    const errors = [];
+    try {
+      await session.bindExtensions({ uiContext: { setStatus() {} }, onError: (error) => errors.push(error) });
+      await session.extensionRunner.emit({ type: "before_agent_start" });
+      assert.deepEqual(errors, []);
+      const customEnabled = options.trusted && options.allowed.includes("*") && !options.command;
+      const active = options.command ? ["ghostty_propose_command"] : [...expectedTools, ...(customEnabled ? ["fixture_lookup"] : [])].sort();
+      assert.deepEqual(session.getActiveToolNames().sort(), active);
+      assert.equal(session.getAllTools().some((tool) => tool.name === "fixture_lookup"), customEnabled,
+        "A fixed --tools allowlist removes custom tools before policy discovery");
+      for (const name of options.command ? ["ghostty_propose_command"] : expectedTools) {
+        assert.equal(session.getAllTools().find((tool) => tool.name === name).sourceInfo.path, "<inline:ghostty>");
+        assert.notEqual(session.getToolDefinition(name).description, "Fixture replacement must not take over Ghostty tools.");
+      }
+      const runner = session.extensionRunner;
+      const call = (toolName) => runner.emitToolCall({ type: "tool_call", toolName, toolCallId: "fixture", input: {} });
+      assert.equal((await call("unknown_tool")).block, true);
+      assert.equal((await call("bash")).block, true);
+      const customCall = await call("fixture_lookup");
+      if (customEnabled) assert.equal(customCall, undefined); else assert.equal(customCall.block, true);
+      if (customEnabled) {
+        const tool = session.agent.state.tools.find((tool) => tool.name === "fixture_lookup");
+        const result = await tool.execute("fixture", {});
+        assert.deepEqual(result, { content: [{ type: "text", text: "fixture plugin result" }], details: { fixture: true } });
+        assert.equal(await runner.emitToolResult({ type: "tool_result", toolName: "fixture_lookup", toolCallId: "fixture", input: {}, ...result, isError: true }), undefined);
+      }
+    } finally { session.dispose(); eventBus.clear(); }
+  }
+});
 
 async function nativeTerminalKeyPolicy() {
   const nativeSource = await fs.readFile(new URL("../../Sources/Features/AI/TerminalAIModel.swift", import.meta.url), "utf8");
@@ -71,14 +228,13 @@ test("only native bridges and scoped SDK file tools are enabled; shell and legac
   assert.ok(!extension.includes("node:child_process"));
 });
 
-test("MCP, plan and attachment tools use reserved bridges, preserve errors, and never execute locally", async () => {
+test("plan and attachment tools use reserved bridges, preserve errors, and never execute locally", async () => {
   const requests = [];
   const native = { ...context, ui: { input: async (title, placeholder, options) => {
     requests.push({ title, params: JSON.parse(placeholder), options });
-    return JSON.stringify({ output: "fixture evidence", result: { safe: true }, isError: title === "ghostty-mcp-v1" });
+    return JSON.stringify({ output: "fixture evidence", result: { safe: true }, isError: title === "ghostty-task-plan-v1" });
   } } };
   const calls = [
-    ["ghostty_mcp", "ghostty-mcp-v1", { operation: "call_tool", server: "fixture", toolName: "lookup", arguments: { query: "fixture" }, reason: "Read fixture evidence." }],
     ["ghostty_task_plan", "ghostty-task-plan-v1", { operation: "verify", status: "passed", commandIds: ["command-fixture"], summary: "Observed successful check." }],
     ["ghostty_context", "ghostty-context-v1", { operation: "read", attachmentId: "fixture" }],
   ];
@@ -89,14 +245,11 @@ test("MCP, plan and attachment tools use reserved bridges, preserve errors, and 
     assert.deepEqual(requests.at(-1).params, params);
     assert.equal(requests.at(-1).options.signal, controller.signal);
     assert.equal(response.details.result.safe, true);
-    assert.equal(response.isError, name === "ghostty_mcp");
+    assert.equal(response.isError, name === "ghostty_task_plan");
     if (response.isError) assert.deepEqual(handlers.get("tool_result")({ toolName: name, details: response.details }), { isError: true });
   }
-  const count = requests.length;
-  await assert.rejects(tools.get("ghostty_mcp").execute("missing-reason", { operation: "read_resource", uri: "fixture://secret" }, undefined, undefined, native), /Explain why/);
-  assert.equal(requests.length, count);
   native.ui.input = async () => JSON.stringify({ error: "Native access denied." });
-  await assert.rejects(tools.get("ghostty_mcp").execute("denied", { operation: "call_tool", reason: "fixture" }, undefined, undefined, native), /denied/);
+  await assert.rejects(tools.get("ghostty_context").execute("denied", { operation: "list" }, undefined, undefined, native), /denied/);
   native.ui.input = async () => undefined;
   await assert.rejects(tools.get("ghostty_context").execute("cancelled", { operation: "list" }, undefined, undefined, native), /outcome may be unknown/);
 });
@@ -734,9 +887,6 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
       const id = list.attachments[0].id;
       delta = { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name: "ghostty_context", arguments: JSON.stringify({ operation: "read", attachmentId: id }) } }] };
       finish = "tool_calls";
-    } else if (marker.includes("__mcp__") && !input.messages.some((message) => message.role === "tool" && String(message.content).includes("fixture mcp output"))) {
-      delta = { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name: "ghostty_mcp", arguments: JSON.stringify({ operation: "call_tool", server: "fixture-server", toolName: "lookup", arguments: { query: "fixture" }, reason: "Inspect external fixture evidence." }) } }] };
-      finish = "tool_calls";
     } else if (marker.includes("__inspect_cpu__") && !input.messages.some((message) => message.role === "tool" && String(message.content).includes("fixture terminal output"))) {
       delta = { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name: "ghostty_terminal", arguments: JSON.stringify({ operation: "run", command: "ps -Ao pid,%cpu,comm -r | head -16", reason: "Inspect highest CPU processes in the current shell." }) } }] };
       finish = "tool_calls";
@@ -899,16 +1049,11 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
         assert.deepEqual(nativeInputs.map((record) => JSON.parse(record.placeholder).operation), ["list", "read"]);
         assert.equal(JSON.parse(nativeInputs[1].placeholder).attachmentId, "fixture-listed-attachment");
         assert.ok(turnRequests.some((request) => request.messages.at(-1).role === "tool" && String(request.messages.at(-1).content).includes('"id":"fixture-listed-attachment"')));
-      } else if (marker === "__mcp__") {
-        assert.equal(executions.length, 2);
-        assert.ok(executions.every((record) => record.toolName === "ghostty_mcp" && !record.isError));
-        const inputs = records.filter((record) => record.type === "extension_ui_request" && record.method === "input");
-        assert.deepEqual(inputs.map((record) => JSON.parse(record.placeholder).operation), ["list_servers", "call_tool"]);
-        assert.equal(executions[1].result.details.result.evidence, "fixture");
-      } else if (marker === "__mcp_fail__" || marker === "__mcp_deny__") {
+      } else if (["__mcp__", "__mcp_fail__", "__mcp_deny__"].includes(marker)) {
+        assert.equal(executions.length, 1);
         assert.equal(executions[0].toolName, "ghostty_mcp");
         assert.equal(executions[0].isError, true);
-        if (marker === "__mcp_deny__") assert.match(executions[0].result.content[0].text, /MCP access denied/);
+        assert.ok(!records.some((record) => record.type === "extension_ui_request" && record.title === "ghostty-mcp-v1"));
       } else if (marker === "__plan__" || marker === "__context__") {
         assert.equal(executions.length, 1);
         assert.equal(executions[0].toolName, marker === "__plan__" ? "ghostty_task_plan" : "ghostty_context");

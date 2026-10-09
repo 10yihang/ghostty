@@ -282,7 +282,7 @@ struct TerminalAIModelTests {
         #expect(secondConfiguration.environment["GHOSTTY_AI_API_KEY"] == "fixture-second-key")
         for configuration in [firstConfiguration, secondConfiguration, nextConfiguration] {
             let toolsIndex = try #require(configuration.arguments.firstIndex(of: "--tools"))
-            #expect(configuration.arguments[toolsIndex + 1] == TerminalAIPolicy.toolNames)
+            #expect(configuration.arguments[toolsIndex + 1] == TerminalAIPolicy.assistantToolSelection)
             #expect(configuration.environment["PI_CODING_AGENT_DIR"] == configuration.agentDirectory.path)
             #expect(configuration.arguments.contains(configuration.agentDirectory.appendingPathComponent("ghostty-tools.mjs").path))
         }
@@ -355,7 +355,7 @@ struct TerminalAIModelTests {
 
         for configuration in [first, second] {
             let toolsIndex = try #require(configuration.arguments.firstIndex(of: "--tools"))
-            #expect(configuration.arguments[toolsIndex + 1] == TerminalAIPolicy.toolNames)
+            #expect(configuration.arguments[toolsIndex + 1] == TerminalAIPolicy.assistantToolSelection)
         }
         #expect(first.agentDirectory == source)
         #expect(first.environment["PI_CODING_AGENT_DIR"] == source.path)

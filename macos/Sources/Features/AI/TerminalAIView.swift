@@ -307,14 +307,41 @@ struct TerminalAIHistoryView: View {
 
 private struct TerminalAISettingsView: View {
     @ObservedObject var model: TerminalAIModel
+    @Environment(\.dismiss) private var dismiss
     @State private var folderError: String?
-    @State private var mcpPresented = false
+    @State private var pluginsPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("AI Settings").font(.headline)
-            Button("MCP tools and resources…") { mcpPresented = true }
-                .disabled(model.isRunning || model.contextLoading)
+            Button("Pi plugins…") { pluginsPresented = true }
+            DisclosureGroup("Pi MCP") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Uses the MCP servers enabled in your existing Pi configuration. Pi manages their connections and tools on This Mac.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Text(URL(fileURLWithPath: model.pluginsDirectory).appendingPathComponent("mcp.json").path)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    Text("Manage servers with Pi:").font(.caption).foregroundStyle(.secondary)
+                    Text("pi mcp add --help\npi mcp list")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    Text("For a custom Pi folder, set PI_CODING_AGENT_DIR to the parent folder of mcp.json. Previous Ghostty MCP servers are not migrated automatically; add them in Pi.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if !model.useExistingPiConfiguration {
+                        Text("Enable Use existing Pi configuration to use your saved MCP servers.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Show connection status") {
+                        model.showPiMCPStatus()
+                        dismiss()
+                    }
+                    .disabled(model.isRunning || model.commandEntryBusy || model.contextLoading || !model.useExistingPiConfiguration)
+                }
+            }
             Button("Connect current shell…", action: model.showSSHSetup)
                 .disabled(model.isRunning && model.terminalIdentity["canSetupShell"] as? Bool != true)
             Form {
@@ -378,12 +405,8 @@ private struct TerminalAISettingsView: View {
         }
         .padding(18)
         .frame(width: 440)
-        .sheet(isPresented: $mcpPresented) {
-            TerminalAIMCPSettingsView(manager: model.mcpManager, attachResource: { id, uri, title in
-                model.attachMCPResource(serverID: id, uri: uri, title: title)
-                mcpPresented = false
-            })
-            .disabled(model.isRunning)
+        .sheet(isPresented: $pluginsPresented) {
+            TerminalAIPluginsView(model: model)
         }
         .onDisappear { model.saveCredentials() }
     }
