@@ -266,6 +266,68 @@ test("native snapshots render rich ordered content and preserve interaction duri
   } finally { dom.window.close(); }
 });
 
+test("multiline composer ignores its own height notifications and still follows panel width", async () => {
+  const observers = new Set();
+  const dom = new JSDOM(html, { runScripts: "outside-only", pretendToBeVisual: true, url: "file:///AIChat/index.html" });
+  const { window } = dom;
+  Object.assign(window, { ReadableStream, TransformStream, WritableStream, TextDecoder, TextEncoder });
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  window.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; }
+    observe(node) { this.node = node; observers.add(this); }
+    unobserve() { observers.delete(this); }
+    disconnect() { observers.delete(this); }
+  };
+  window.IntersectionObserver = class { observe() {} disconnect() {} };
+  window.HTMLElement.prototype.scrollIntoView = function () {};
+  window.HTMLElement.prototype.scrollTo = function (options) { this.scrollTop = options?.top ?? this.scrollTop; };
+  window.webkit = { messageHandlers: { ghosttyAI: { postMessage() {} } } };
+  window.eval(script);
+  try {
+    await until(() => window.document.querySelector('[aria-label="Message AI"]'));
+    const node = window.document.querySelector('[aria-label="Message AI"]');
+    let width = 320;
+    let height = 52;
+    Object.defineProperty(node, "scrollHeight", { configurable: true, get: () => height });
+    node.getBoundingClientRect = () => ({ width, height: Number.parseFloat(node.style.height) || height });
+    const setValue = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    const input = async (value) => {
+      setValue.call(node, value);
+      node.dispatchEvent(new window.Event("input", { bubbles: true }));
+      await tick();
+    };
+    await input("第一行\n第二行");
+    const mutations = [];
+    const watcher = new window.MutationObserver((records) => mutations.push(...records));
+    watcher.observe(node, { attributes: true, attributeFilter: ["style"] });
+    const deliver = async () => {
+      for (const observer of observers) {
+        if (observer.node === node) observer.callback([{ target: node, contentRect: node.getBoundingClientRect() }]);
+      }
+      await tick();
+    };
+    for (let frame = 0; frame < 5; frame++) await deliver();
+    assert.equal(mutations.length, 0, "An autosize height notification must not measure and write that same textarea again");
+    for (const suffix of ["继", "继续", "继续输入"]) {
+      await input("第一行\n第二行" + suffix);
+      mutations.length = 0;
+      await deliver();
+      assert.equal(mutations.length, 0, "Typing must not restart a height feedback loop");
+      assert.equal(window.document.activeElement, node);
+      assert.equal(node.selectionStart, node.value.length);
+    }
+    const previous = Number.parseFloat(node.style.height);
+    width = 220;
+    height = 72;
+    await deliver();
+    assert.ok(Number.parseFloat(node.style.height) > previous, "Narrowing the panel still grows the wrapped draft");
+    height = 32;
+    await input("短草稿");
+    assert.equal(node.style.height, "32px", "Deleting lines still shrinks the composer");
+    watcher.disconnect();
+  } finally { dom.window.close(); }
+});
+
 test("packaged HTML allows local assets and blocks remote execution and connections", () => {
   assert.match(html, /script-src 'self'/);
   assert.match(html, /connect-src 'none'/);

@@ -395,16 +395,31 @@ function Chat() {
     const node = composer.current;
     if (!node) return;
     const resize = () => {
+      const transcript = viewport.current;
+      const scrollTop = transcript?.scrollTop ?? 0;
       node.style.height = "auto";
       const height = node.scrollHeight;
       node.style.height = `${Math.min(100, Math.max(32, height))}px`;
       node.style.overflowY = height > 100 ? "auto" : "hidden";
+      // Measuring a shorter textarea temporarily enlarges the transcript and
+      // WebKit clamps its scroll offset. Restore it before the next paint.
+      if (transcript) {
+        const target = stickToBottom.current && !selectionLocked ? Math.max(0, transcript.scrollHeight - transcript.clientHeight) : scrollTop;
+        if (transcript.scrollTop !== target) transcript.scrollTop = target;
+      }
     };
     resize();
-    const observer = new ResizeObserver(resize);
+    let width = node.getBoundingClientRect().width;
+    const observer = new ResizeObserver(() => {
+      const nextWidth = node.getBoundingClientRect().width;
+      // Autosizing changes height itself; only panel width can change wrapping.
+      if (nextWidth === width) return;
+      width = nextWidth;
+      resize();
+    });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [prompt]);
+  }, [prompt, selectionLocked]);
   const send = useCallback((text: string, steer = false) => {
     if (!text.trim() || composing.current || snapshot.contextLoading || currentSnapshot.contextLoading) return;
     if (snapshot.configurationIssue) { action({ type: "settings" }); return; }
