@@ -129,6 +129,120 @@ test("Pi completeSimple maps the low reasoning budget using a synthetic transpor
   assert.deepEqual(verdict, assessment());
 });
 
+test("a transient Guardian HTTP 503 retries once before accepting a completed assessment", async () => {
+  const packagePath = process.env.GHOSTTY_PI_PACKAGE || "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
+  const { completeSimple } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-ai/dist/compat.js")));
+  const ctx = context();
+  ctx.model = { ...ctx.model, name: "Retry fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 8192,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  let calls = 0;
+  const result = await assessRequest(request(), ctx, { complete: (model, review, options) => completeSimple(model, review, {
+    ...options, fetch: async () => {
+      calls++;
+      if (calls === 1) return new Response(JSON.stringify({ error: { message: "Synthetic transient response with private provider detail" } }),
+        { status: 503, headers: { "content-type": "application/json", "retry-after-ms": "1" } });
+      const chunk = { choices: [{ index: 0, delta: { role: "assistant", content: JSON.stringify(assessment()) }, finish_reason: "stop" }] };
+      return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } });
+    },
+  }) });
+  assert.equal(calls, 2);
+  assert.deepEqual(result, assessment());
+});
+
+test("Guardian transport retry stays bounded and 401 or missing credentials never retry", async () => {
+  const packagePath = process.env.GHOSTTY_PI_PACKAGE || "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
+  const { completeSimple } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-ai/dist/compat.js")));
+  for (const status of [401, 503]) {
+    let calls = 0;
+    const ctx = context();
+    ctx.model = { ...ctx.model, name: "Retry fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 8192,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const response = await invokeGuardian({ complete: (model, review, options) => completeSimple(model, review, {
+      ...options, fetch: async () => {
+        calls++;
+        return new Response(JSON.stringify({ error: { message: "private-provider-response-credential" } }),
+          { status, headers: { "content-type": "application/json", "retry-after-ms": "1", "x-private-header": "private-header" } });
+      },
+    }) }, ctx);
+    assert.equal(calls, status === 401 ? 1 : 2);
+    assert.equal(response.error, `Guardian provider request failed (HTTP ${status}); ask the user.`);
+    assert.ok(!response.error.includes("private-"));
+    assert.equal(response.assessment, undefined);
+  }
+  for (const getApiKeyAndHeaders of [async () => ({ ok: false, error: "private-credential-error" }), async () => { throw new Error("private-credential-error"); }]) {
+    let calls = 0;
+    const ctx = { ...context(), modelRegistry: { getApiKeyAndHeaders } };
+    const response = await invokeGuardian({ complete: async () => { calls++; return message(assessment()); } }, ctx);
+    assert.equal(calls, 0);
+    assert.equal(response.error, "Guardian review credentials are unavailable; ask the user.");
+    assert.equal(response.assessment, undefined);
+  }
+});
+
+test("the overall Guardian deadline and cancellation stop transport retry backoff", async () => {
+  const packagePath = process.env.GHOSTTY_PI_PACKAGE || "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
+  const { completeSimple } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-ai/dist/compat.js")));
+  for (const cancel of [false, true]) {
+    const controller = new AbortController();
+    const ctx = context();
+    ctx.signal = controller.signal;
+    ctx.model = { ...ctx.model, name: "Abort fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 8192,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    let calls = 0, began;
+    const firstRequest = new Promise((resolve) => { began = resolve; });
+    const responsePromise = invokeGuardian({ timeoutMs: cancel ? 20000 : 30, complete: (model, review, options) => completeSimple(model, review, {
+      ...options, fetch: async () => {
+        calls++;
+        began();
+        return new Response(JSON.stringify({ error: { message: "private-503" } }),
+          { status: 503, headers: { "content-type": "application/json", "retry-after-ms": "200" } });
+      },
+    }) }, ctx);
+    await firstRequest;
+    if (cancel) controller.abort();
+    const response = await responsePromise;
+    assert.equal(calls, 1);
+    assert.equal(response.error, cancel ? "Guardian review was cancelled; ask the user." : "Guardian review timed out; ask the user.");
+    assert.equal(response.assessment, undefined);
+  }
+});
+
+test("invalid assessments, token cutoff and policy evidence failures have controlled reasons and stay closed", async () => {
+  for (const [modelResponse, raw, reason] of [
+    [message("not-json-with-private-provider-detail"), request(), /returned an invalid assessment/],
+    [message({ ...assessment(), unexpected: "private-provider-detail" }), request(), /returned an invalid assessment/],
+    [{ stopReason: "length", content: [{ type: "text", text: JSON.stringify(assessment()) }] }, request(), /token limit/],
+    [message(assessment("high", "high")), { ...request(), narrowScopeEvidence: undefined }, /classified this action as high risk/],
+    [message(assessment()), { ...request(), evidenceComplete: false }, /requires complete action evidence/],
+  ]) {
+    let calls = 0;
+    const response = await invokeGuardian({ complete: async () => { calls++; return modelResponse; } }, context(), raw);
+    assert.equal(calls, 1);
+    assert.match(response.error, reason);
+    assert.ok(!response.error.includes("private-provider-detail"));
+    assert.equal(response.assessment, undefined);
+  }
+  const response = await invokeGuardian({ complete: async () => { throw Object.assign(new Error("private-response-and-credentials"), { status: 502 }); } });
+  assert.equal(response.error, "Guardian provider request failed (HTTP 502); ask the user.");
+  assert.equal(response.assessment, undefined);
+});
+
+async function invokeGuardian(options, ctx = context(), raw = request()) {
+  let command;
+  createGuardianExtension(options)({ on() {}, registerCommand: (_name, definition) => { command = definition; } });
+  let response;
+  await command.handler(JSON.stringify(raw), { ...ctx, ui: { input: async (title, value) => {
+    assert.equal(title, REVIEW_BRIDGE);
+    response = JSON.parse(value);
+    return "native acknowledgement";
+  } } });
+  assert.equal(response.reviewId, raw.reviewId);
+  assert.equal(response.nonce, raw.nonce);
+  assert.equal(response.actionDigest, raw.actionDigest);
+  assert.equal(response.generation, raw.generation);
+  return response;
+}
+
 test("cancel and timeout cover credentials and completion without triggering an execution tool", async () => {
   const controller = new AbortController();
   controller.abort();

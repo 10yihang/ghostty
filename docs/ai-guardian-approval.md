@@ -29,7 +29,15 @@ check the workspace, original content and fingerprint immediately before applyin
 the reviewed diff. Stop, manual terminal input, changed task instructions,
 terminal changes and connection shutdown invalidate pending reviews. A timeout,
 reviewer failure, malformed result or incomplete evidence uses the existing
-manual approval dialog. The chat records allowed/denied risk and rationale.
+manual approval dialog. The chat records allowed/denied risk and rationale, plus
+the reason when automatic review falls back to manual approval.
+
+Each review has one 20-second deadline, including a single transport retry for
+transient provider failures. Authentication failures and invalid assessments do
+not retry. Failure messages distinguish provider HTTP errors, unavailable
+credentials, timeout/cancellation, invalid assessments and insufficient policy
+evidence without exposing raw provider responses or credentials. A failed review
+still requires manual approval.
 
 This plugin covers Ghostty-managed terminal runs and local edit/write requests.
 File reads retain their existing workspace checks. Pi's native MCP tools and

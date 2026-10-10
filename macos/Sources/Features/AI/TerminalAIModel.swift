@@ -2311,7 +2311,8 @@ extension TerminalAIModel {
             return
         }
         switch decision {
-        case .ask(let reason): presentManualReview(pending.operation, reason: reason)
+        case .ask(let reason):
+            presentManualReview(pending.operation, reason: reason)
         case .deny(let assessment):
             recordApprovalReview(assessment, allowed: false)
             rejectReviewedOperation(pending.operation, reason: "Automatic review denied this action (\(assessment.riskLevel.rawValue)): \(assessment.rationale)")
@@ -2350,6 +2351,11 @@ extension TerminalAIModel {
     }
 
     private func presentManualReview(_ operation: ReviewOperation, reason: String? = nil) {
+        if isAutomaticReviewEnabled, let reason {
+            receivePluginMessage(["role": "custom", "customType": "Codex Guardian", "display": true,
+                                  "timestamp": UUID().uuidString,
+                                  "content": "Manual review needed\n\(String(reason.prefix(4_096)))"])
+        }
         respondToApproval(allow: false)
         switch operation {
         case .terminal(let id, let payload, let target):

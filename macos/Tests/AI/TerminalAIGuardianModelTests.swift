@@ -81,6 +81,9 @@ struct TerminalAIGuardianModelTests {
         #expect(fixture.model.phase == .waitingApproval && fixture.model.isRunning)
         #expect(fixture.recording.operations.isEmpty)
         #expect(!fixture.hasResponse("terminal"))
+        #expect(fixture.model.response.contains("Manual review needed"),
+                "A failed automatic review must explain its fallback in the persistent conversation.")
+        if scenario == "fault" { #expect(fixture.model.response.contains("The reviewer is unavailable")) }
         fixture.model.respondToApproval(allow: false)
         #expect(fixture.recording.operations.isEmpty)
         #expect(try fixture.response("terminal")["error"] is String)
