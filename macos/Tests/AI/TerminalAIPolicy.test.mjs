@@ -30,7 +30,12 @@ await fs.writeFile(path.join(temporary, "policy.mjs"), extension);
 const { default: register } = await import(pathToFileURL(path.join(temporary, "policy.mjs")));
 const tools = new Map();
 const handlers = new Map();
-register({ on: (name, handler) => handlers.set(name, handler), registerTool: (tool) => tools.set(tool.name, tool) });
+const privateCommands = new Map();
+register({ on: (name, handler) => handlers.set(name, handler), registerTool: (tool) => tools.set(tool.name, tool),
+  registerCommand: (name, command) => privateCommands.set(name, command),
+  getAllTools: () => [...tools.values()].map((tool) => ({ ...tool, sourceInfo: { path: "<inline:policy>" } })),
+  getCommands: () => [...privateCommands.keys()].map((name) => ({ name, source: "extension", sourceInfo: { path: "<inline:policy>" } })),
+});
 let ready = false;
 const context = { cwd: workspace, hasUI: true, ui: { setStatus: () => { ready = true; }, confirm: async () => false } };
 await handlers.get("session_start")({}, context);
@@ -56,6 +61,7 @@ async function trustedPolicyFixture(options = {}) {
   const register = await policyFactory(options);
   const registered = new Map();
   const events = new Map();
+  const commands = new Map();
   const custom = [{ name: "fixture_lookup", sourceInfo: { source: "inline", path: "<inline:selected-fixture>" } },
     { name: "bash", sourceInfo: { source: "builtin", path: "builtin:bash" } }, { name: "powershell", sourceInfo: { source: "inline", path: "<inline:selected-fixture>" } },
     { name: "fixture_builtin", sourceInfo: { source: "builtin", path: "builtin:bash" } },
@@ -64,11 +70,13 @@ async function trustedPolicyFixture(options = {}) {
   let active;
   register({
     on: (name, handler) => events.set(name, handler), registerTool: (tool) => registered.set(tool.name, tool),
-    getAllTools: () => [...registered.values(), ...custom], setActiveTools: (names) => { active = names; },
+    registerCommand: (name, command) => commands.set(name, command),
+    getCommands: () => options.commandInventory ?? [...commands.keys()].map((name) => ({ name, source: "extension", sourceInfo: { path: "<inline:ghostty-fixture>" } })),
+    getAllTools: () => [...registered.values()].map((tool) => ({ ...tool, sourceInfo: { path: "<inline:ghostty-fixture>" } })).concat(custom), setActiveTools: (names) => { active = names; },
   });
   await events.get("session_start")({}, context);
   if (options.startTask !== false) events.get("before_agent_start")();
-  return { registered, events, custom, get active() { return active; } };
+  return { registered, events, commands, custom, get active() { return active; } };
 }
 
 test("selected trusted extensions enable only registered custom tools and leave plugin results untouched", async () => {
@@ -114,13 +122,23 @@ test("trusted custom tools share the native task budget and refresh registration
     assert.equal(fixture.events.get("tool_call")({ toolName: index % 2 ? "fixture_late_tool" : "ghostty_terminal" }), undefined);
   }
   assert.deepEqual(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }), {
-    block: true, reason: "The task reached its diagnostic limit. Summarize the evidence and ask the user how to continue.", terminate: true,
+    block: true, reason: "The investigation reached its 40-tool-call limit. Tools are paused until the user continues. Summarize the evidence and ask the user how to continue.",
   });
   fixture.events.get("before_agent_start")();
+  assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true);
+  fixture.events.get("input")({ text: "Continue", source: "extension" });
+  assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true);
+  fixture.events.get("input")({ text: "/_ghostty_guardian_review fixture", source: "rpc" });
+  assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true);
+  fixture.events.get("input")({ text: "请继续", source: "rpc", streamingBehavior: "followUp" }, context);
+  assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true, "An unarmed human-looking input does not renew");
+  await fixture.commands.get("_ghostty_begin_work_segment").handler(createHash("sha256").update("请继续").digest("hex"));
+  fixture.events.get("input")({ text: "请继续", source: "rpc", streamingBehavior: "followUp" }, context);
+  assert.ok(fixture.active.includes("fixture_late_tool"));
   const now = Date.now;
   try {
-    Date.now = () => now() + 10 * 60 * 1000 + 1;
-    assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).terminate, true);
+    Date.now = () => now() + 30 * 60 * 1000;
+    assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }), undefined);
   } finally { Date.now = now; }
 });
 
@@ -132,6 +150,46 @@ test("extension commands can call approved tools before the first agent turn sta
     if (trusted) assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }), undefined);
     else assert.equal(fixture.events.get("tool_call")({ toolName: "fixture_lookup" }).block, true);
   }
+});
+
+test("diagnostic-segment handshake fails closed for missing, foreign and colliding commands", async () => {
+  const owned = { name: "_ghostty_begin_work_segment", source: "extension", sourceInfo: { path: "<inline:ghostty-fixture>" } };
+  for (const commandInventory of [[], [{ ...owned, source: "prompt" }], [{ ...owned, sourceInfo: { path: "<inline:foreign>" } }],
+    [{ ...owned, name: owned.name + ":1" }, { ...owned, name: owned.name + ":2" }]]) {
+    await assert.rejects(trustedPolicyFixture({ commandInventory }), /private diagnostic-segment command is missing or conflicts/);
+  }
+});
+
+test("diagnostic segments are one-use, short-lived and consume only the matching native human wire", async () => {
+  const f = await trustedPolicyFixture();
+  const begin = f.commands.get("_ghostty_begin_work_segment").handler;
+  const hash = createHash("sha256").update("Continue human work").digest("hex");
+  const call = () => f.events.get("tool_call")({ toolName: "ghostty_terminal" });
+  const exhaust = () => { for (let index = 0; index < 40; index++) assert.equal(call(), undefined); assert.equal(call().block, true); };
+  const input = (text, source = "rpc") => f.events.get("input")({ text, source }, context);
+  for (const invalid of [undefined, "", "not-a-digest", hash.toUpperCase(), hash + " "]) await assert.rejects(begin(invalid), /Invalid Ghostty diagnostic-segment handshake/);
+  exhaust();
+  await begin(hash);
+  assert.equal(call().block, true, "Arming is not a reset");
+  input("Continue human work", "extension");
+  assert.equal(call().block, true);
+  input("/_ghostty_guardian_review fixture");
+  assert.equal(call().block, true);
+  input("Continue human work");
+  exhaust();
+  input("Continue human work");
+  assert.equal(call().block, true, "The matching hash was already consumed");
+  await begin(hash);
+  input("A different human wire");
+  input("Continue human work");
+  assert.equal(call().block, true, "A mismatched human input consumes the arm without renewing");
+  const now = Date.now;
+  try {
+    await begin(hash);
+    Date.now = () => now() + 30001;
+    input("Continue human work");
+    assert.equal(call().block, true, "Expired arms cannot authorize a late reset");
+  } finally { Date.now = now; }
 });
 
 test("Pi SDK preserves Ghostty registrations first and admits custom tools only through a matching CLI allowlist", async () => {
@@ -255,6 +313,59 @@ test("plan and attachment tools use reserved bridges, preserve errors, and never
   await assert.rejects(tools.get("ghostty_context").execute("cancelled", { operation: "list" }, undefined, undefined, native), /outcome may be unknown/);
 });
 
+test("plan tools publish actual IDs and statuses in SDK model content for reads and updates", async () => {
+  const sdk = await import(pathToFileURL(path.join(packagePath, "dist/index.js")));
+  const task = { id: "native-plan", title: "Investigate fixture", steps: [
+    { id: "transient", title: "Inspect short-lived process", status: "completed", evidence: "large evidence ".repeat(10000) },
+  ], verification: { status: "pending", summary: "Run a recorded check", evidence: "large verification evidence" } };
+  const requests = [];
+  const native = { ...context, ui: { input: async (title, placeholder) => {
+    requests.push({ title, params: JSON.parse(placeholder) });
+    return JSON.stringify({ output: "Investigation updated.", task });
+  } } };
+  for (const params of [{ operation: "get_plan" }, { operation: "update_step", stepId: "transient", status: "completed" }]) {
+    const response = await tools.get("ghostty_task_plan").execute("plan-state", params, undefined, undefined, native);
+    assert.equal(requests.at(-1).title, "ghostty-task-plan-v1");
+    assert.deepEqual(requests.at(-1).params, params);
+    const llm = sdk.convertToLlm([{ role: "toolResult", toolCallId: "plan-state", toolName: "ghostty_task_plan",
+      content: response.content, details: response.details, isError: response.isError, timestamp: Date.now() }]);
+    const serialized = sdk.serializeConversation(llm);
+    assert.match(serialized, /Current investigation plan:/);
+    assert.match(serialized, /"id":"transient"/);
+    assert.match(serialized, /"status":"completed"/);
+    assert.match(serialized, /"verification":\{"status":"pending"/);
+    assert.ok(!serialized.includes("large evidence"));
+    assert.ok(!serialized.includes("large verification evidence"));
+    assert.ok(serialized.length < 2048);
+    assert.deepEqual(response.details.task, task);
+  }
+  native.ui.input = async () => JSON.stringify({ error: "Unknown step ID transient.\nCurrent investigation plan:\n" +
+    JSON.stringify({ steps: [{ id: "inspect", status: "pending" }] }), task });
+  await assert.rejects(tools.get("ghostty_task_plan").execute("missing", { operation: "update_step", stepId: "transient", status: "completed" },
+    undefined, undefined, native), /Unknown step ID transient\.[\s\S]*"id":"inspect"/);
+});
+
+test("plan schema rejects invented statuses and checks each operation's required fields before native access", async () => {
+  const { validateToolArguments } = await import(pathToFileURL(path.join(packagePath,
+    "node_modules/@earendil-works/pi-ai/dist/utils/validation.js")));
+  const tool = tools.get("ghostty_task_plan");
+  for (const status of ["done", "in_progress", "unknown"]) {
+    assert.throws(() => validateToolArguments(tool, { id: "invalid", name: tool.name,
+      arguments: { operation: "update_step", stepId: "transient", status } }), /Validation failed/);
+  }
+  assert.deepEqual(validateToolArguments(tool, { id: "read", name: tool.name, arguments: { operation: "get_plan" } }), { operation: "get_plan" });
+  let nativeCalls = 0;
+  const native = { ...context, ui: { input: async () => { nativeCalls++; return "{}"; } } };
+  for (const [params, error] of [
+    [{ operation: "set_plan" }, /set_plan requires 1–12 steps/],
+    [{ operation: "update_step", status: "completed" }, /existing stepId/],
+    [{ operation: "update_step", stepId: "transient", status: "passed" }, /status pending, running, completed or failed/],
+    [{ operation: "verify", status: "completed", commandIds: ["actual"] }, /status passed or failed/],
+    [{ operation: "verify", status: "passed", commandIds: [] }, /actual completed commandIds/],
+  ]) await assert.rejects(tool.execute("missing-required", params, undefined, undefined, native), error);
+  assert.equal(nativeCalls, 0);
+});
+
 test("command mode registers only proposals and rejects execution and external access", async () => {
   process.env.GHOSTTY_AI_MODE = "command";
   await fs.writeFile(path.join(temporary, "command-policy.mjs"), extension);
@@ -262,7 +373,7 @@ test("command mode registers only proposals and rejects execution and external a
   delete process.env.GHOSTTY_AI_MODE;
   const commands = new Map();
   const events = new Map();
-  commandRegister({ on: (name, handler) => events.set(name, handler), registerTool: (tool) => commands.set(tool.name, tool) });
+  commandRegister({ on: (name, handler) => events.set(name, handler), registerTool: (tool) => commands.set(tool.name, tool), registerCommand() {} });
   assert.deepEqual([...commands.keys()], ["ghostty_propose_command"]);
   for (const name of expectedTools.filter((name) => name !== "ghostty_propose_command")) assert.equal(events.get("tool_call")({ toolName: name }).block, true);
   assert.equal(events.get("user_bash")({ command: "pwd" }).result.exitCode, 1);
@@ -796,14 +907,154 @@ test("terminal malformed responses fail without reporting execution success", as
   }
 });
 
-test("task budget blocks an unbounded terminal loop", () => {
+test("task budget blocks an unbounded terminal loop", async () => {
+  await privateCommands.get("_ghostty_begin_work_segment").handler(createHash("sha256").update("Start a bounded investigation").digest("hex"));
+  handlers.get("input")({ text: "Start a bounded investigation", source: "interactive" }, context);
   handlers.get("before_agent_start")();
   for (let index = 0; index < 40; index++) {
     assert.equal(handlers.get("tool_call")({ toolName: "ghostty_terminal" }), undefined);
   }
   const blocked = handlers.get("tool_call")({ toolName: "ghostty_terminal" });
   assert.equal(blocked.block, true);
-  assert.equal(blocked.terminate, true);
+  assert.equal(blocked.terminate, undefined, "Leave a final tool-free summary turn instead of terminating before it");
+  let aborted = false;
+  handlers.get("turn_end")({}, { abort: () => { aborted = true; }, hasPendingMessages: () => false });
+  assert.equal(aborted, false, "Do not abort the batch that first crossed the limit");
+  handlers.get("turn_start")();
+  handlers.get("turn_end")({}, { abort: () => { aborted = true; }, hasPendingMessages: () => false });
+  assert.equal(aborted, true, "End after the one summary turn");
+});
+
+test("Pi SDK budgets native human work segments, excludes wall-clock waits and offers one tool-free summary", async (t) => {
+  const sdk = await import(pathToFileURL(path.join(packagePath, "dist/index.js")));
+  const { Agent } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-agent-core/dist/index.js")));
+  const { createAssistantMessageEventStream, getCurrentTools } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-ai/dist/index.js")));
+  const { loadExtensionFromFactory } = await import(pathToFileURL(path.join(packagePath, "dist/core/extensions/loader.js")));
+  const model = { id: "fixture", name: "Fixture", api: "openai-completions", provider: "fixture", baseUrl: "http://127.0.0.1:1", reasoning: false,
+    input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 512 };
+  const call = (id) => ({ type: "toolCall", id, name: "ghostty_terminal", arguments: { operation: "read" } });
+  const batch = (id) => Array.from({ length: 40 }, (_, index) => call(`${id}-${index}`));
+  const summary = [{ type: "text", text: "Fixture evidence summary. Continue?" }];
+  const empty = () => ({ skills: [], prompts: [], themes: [], agentsFiles: [], diagnostics: [] });
+  const humanPrompt = async (session, text, options = {}) => {
+    await session.prompt(`/_ghostty_begin_work_segment ${createHash("sha256").update(text).digest("hex")}`, { source: "rpc" });
+    await session.prompt(text, { source: "rpc", ...options });
+  };
+  async function fixture(content, onInput = async () => {}, options = {}) {
+    const runtime = sdk.createExtensionRuntime(), eventBus = sdk.createEventBus();
+    const registerPolicy = await policyFactory();
+    let starts = 0, executed = 0, privateCalls = 0, rounds = 0;
+    const providerTools = [];
+    const statuses = [], errors = [];
+    const policy = await loadExtensionFromFactory((pi) => registerPolicy({ ...pi, on: (name, handler) => pi.on(name, (...args) => {
+      if (name === "before_agent_start") starts++;
+      return handler(...args);
+    }) }), workspace, eventBus, runtime, "<inline:ghostty-budget>");
+    const privateExtension = await loadExtensionFromFactory((pi) => {
+      pi.registerCommand("_ghostty_guardian_review", { description: "Isolated private command; never invokes a reviewer or model", handler: async () => { privateCalls++; } });
+      if (options.transformInput) pi.on("input", (event) => ({ action: "transform", text: "Pi transformed: " + event.text }));
+      if (options.collision) pi.registerCommand("_ghostty_begin_work_segment", { description: "Conflicting fixture command", handler: async () => {} });
+    }, workspace, eventBus, runtime, "<inline:private-fixture>");
+    let session;
+    const agent = new Agent({ initialState: { model }, transformContext: (messages) => session.extensionRunner.emitContext(messages), streamFn: (_model, context, options) => {
+      assert.equal(options.signal.aborted, false, "No extra provider call after the summary");
+      providerTools.push(getCurrentTools(context.messages).map((tool) => tool.name));
+      const parts = content(++rounds);
+      const message = { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: parts,
+        stopReason: parts.some((part) => part.type === "toolCall") ? "toolUse" : "stop", timestamp: Date.now(),
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: message.stopReason, message }); });
+      return stream;
+    } });
+    session = new sdk.AgentSession({ agent, cwd: workspace, sessionManager: sdk.SessionManager.inMemory(workspace),
+      settingsManager: sdk.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }), modelRuntime: { hasConfiguredAuth: () => true },
+      initialActiveToolNames: ["ghostty_terminal"], resourceLoader: { getExtensions: () => ({ extensions: [policy, privateExtension], runtime, errors: [], warnings: [] }),
+        getSkills: empty, getPrompts: empty, getThemes: empty, getAgentsFiles: empty, getSystemPrompt: () => "Isolated budget fixture.", getAppendSystemPrompt: () => [], extendResources() {}, async reload() {} } });
+    await session.bindExtensions({ mode: "rpc", onError: (error) => errors.push(error), uiContext: { setStatus: (key, value) => statuses.push([key, value]), input: async () => {
+      await onInput(++executed, session);
+      return JSON.stringify({ output: "Isolated fixture output", operation: "read" });
+    } } });
+    return { session, agent, providerTools, statuses, errors, humanPrompt: (text, options) => humanPrompt(session, text, options), stats: () => ({ starts, executed, privateCalls, rounds }), dispose: () => { session.dispose(); eventBus.clear(); } };
+  }
+  await t.test("40 admitted calls then a tool-free summary, and idle human continuation renews", async () => {
+    const f = await fixture((round) => round === 1 ? batch("initial") : [2, 4].includes(round) ? [call(`call-${round}`)] : summary);
+    try {
+      await f.humanPrompt("Initial human request");
+      assert.deepEqual(f.stats(), { starts: 1, executed: 40, privateCalls: 0, rounds: 3 });
+      assert.deepEqual(f.providerTools[2], []);
+      assert.deepEqual(f.statuses.slice(-2), [["ghostty-diagnostics", "ready"], ["ghostty-diagnostics", "paused"]]);
+      assert.equal(f.agent.state.messages.at(-1).content[0].text, summary[0].text);
+      await f.humanPrompt("请继续");
+      assert.deepEqual(f.stats(), { starts: 2, executed: 41, privateCalls: 0, rounds: 5 });
+      assert.ok(f.providerTools[3].includes("ghostty_terminal"));
+      assert.deepEqual(f.statuses.at(-1), ["ghostty-diagnostics", "ready"]);
+    } finally { f.dispose(); }
+  });
+  await t.test("selected Pi input transformations preserve native hash-bound renewal", async () => {
+    const f = await fixture((round) => round === 1 ? batch("initial") : [2, 4].includes(round) ? [call(`call-${round}`)] : summary, undefined, { transformInput: true });
+    try {
+      await f.humanPrompt("Initial human request");
+      await f.humanPrompt("请继续");
+      assert.deepEqual(f.stats(), { starts: 2, executed: 41, privateCalls: 0, rounds: 5 });
+      assert.equal(f.agent.state.messages.filter((message) => message.role === "user").at(-1).content[0].text, "Pi transformed: 请继续");
+      assert.deepEqual(f.statuses.at(-1), ["ghostty-diagnostics", "ready"]);
+    } finally { f.dispose(); }
+  });
+  await t.test("real SDK command collisions prevent the policy-ready handshake", async () => {
+    const f = await fixture(() => { throw new Error("No provider may run after a command collision"); }, undefined, { collision: true });
+    try {
+      assert.equal(f.statuses.some(([key, value]) => key === "ghostty-policy" && value === "ready"), false);
+      assert.ok(f.errors.some((error) => /private diagnostic-segment command is missing or conflicts/.test(error.error)));
+      assert.equal(f.stats().rounds, 0);
+    } finally { f.dispose(); }
+  });
+  await t.test("an admitted native wait over 10 minutes does not block the next tool", async () => {
+    const now = Date.now;
+    let elapsed = 0;
+    Date.now = () => now() + elapsed;
+    const f = await fixture((round) => round <= 2 ? [call(`slow-${round}`)] : summary, async (count) => { if (count === 1) elapsed += 31 * 60 * 1000; });
+    try {
+      await f.humanPrompt("Long human investigation");
+      assert.equal(f.stats().executed, 2);
+      assert.equal(f.agent.state.messages.some((message) => message.role === "toolResult" && message.isError), false);
+      assert.ok(f.providerTools[2].includes("ghostty_terminal"));
+    } finally { Date.now = now; f.dispose(); }
+  });
+  for (const streamingBehavior of ["steer", "followUp"]) await t.test(`native human ${streamingBehavior} renews 40 further calls across running and queued work`, async () => {
+    const f = await fixture((round) => {
+      if (round === 1 || (streamingBehavior === "steer" && round === 2)) return batch(`segment-${round}`);
+      if (streamingBehavior === "followUp" && [2, 4].includes(round)) return Array.from({ length: round === 2 ? 11 : 29 }, (_, index) => call(`segment-${round}-${index}`));
+      if (round === (streamingBehavior === "steer" ? 4 : 3) || round === 6) return summary;
+      return [call(`over-${round}`)];
+    }, async (count, session) => { if (count === 40) await humanPrompt(session, "请继续", { streamingBehavior }); });
+    try {
+      await f.humanPrompt("Initial human request");
+      assert.deepEqual(f.stats(), { starts: 1, executed: 80, privateCalls: 0, rounds: streamingBehavior === "steer" ? 4 : 6 });
+      assert.deepEqual(f.providerTools.at(-1), []);
+      assert.equal(f.agent.state.messages.filter((message) => message.role === "user").length, 2);
+    } finally { f.dispose(); }
+  });
+  await t.test("Guardian private command and extension-authored input do not renew", async () => {
+    const f = await fixture((round) => round === 1 ? batch("initial") : round === 2 ? [call("over")] : summary, async (count, session) => {
+      if (count !== 40) return;
+      await session.prompt("/_ghostty_guardian_review fixture", { source: "rpc" });
+      await session.prompt("Extension-authored continuation", { source: "extension", streamingBehavior: "steer" });
+    });
+    try {
+      await f.humanPrompt("Initial human request");
+      assert.deepEqual(f.stats(), { starts: 1, executed: 40, privateCalls: 1, rounds: 3 });
+      assert.deepEqual(f.providerTools[2], []);
+    } finally { f.dispose(); }
+  });
+  await t.test("a provider ignoring tool-free summary cannot execute or loop again", async () => {
+    const f = await fixture((round) => round === 1 ? batch("initial") : [call(`ignored-${round}`)]);
+    try {
+      await f.humanPrompt("Initial human request");
+      assert.deepEqual(f.stats(), { starts: 1, executed: 40, privateCalls: 0, rounds: 3 });
+      assert.deepEqual(f.providerTools[2], []);
+    } finally { f.dispose(); }
+  });
 });
 
 test("real Pi RPC advertises native bridges and scoped SDK tools and consumes results, failures, and denied access", async () => {

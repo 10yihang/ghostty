@@ -36,7 +36,12 @@ enum TerminalAIPolicy {
     const names = new Set(commandMode ? ["ghostty_propose_command"] : reservedNames);
     const maxOutput = 32768;
     let toolCalls = 0;
-    let taskStarted = 0;
+    let budgetSummary = false;
+    let summaryTurn = false;
+    const segmentCommand = "_ghostty_begin_work_segment";
+    let segmentHash;
+    let segmentDeadline = 0;
+    let policyReady = false;
     let workspaceRoot;
     let workspaceIdentity;
     const result = (text, details = {}, isError = false) => ({
@@ -114,6 +119,11 @@ enum TerminalAIPolicy {
         pi.setActiveTools?.([...active]);
       };
       pi.on("session_start", async (_event, ctx) => {
+        const ownPath = pi.getAllTools?.().find((tool) => tool.name === (commandMode ? "ghostty_propose_command" : "ghostty_terminal"))?.sourceInfo?.path;
+        const commands = pi.getCommands?.().filter((command) => command.name === segmentCommand || command.name.startsWith(segmentCommand + ":")) ?? [];
+        if (!ownPath || commands.length !== 1 || commands[0].name !== segmentCommand || commands[0].source !== "extension" || commands[0].sourceInfo?.path !== ownPath) {
+          throw new Error("Ghostty's private diagnostic-segment command is missing or conflicts with another extension. Disable the conflicting extension before starting a task.");
+        }
         const configured = process.env.GHOSTTY_AI_WORKSPACE;
         if (!configured) throw new Error("Ghostty must select a local task directory before starting Pi.");
         const workspace = await fs.realpath(configured);
@@ -123,19 +133,47 @@ enum TerminalAIPolicy {
         workspaceRoot = workspace;
         workspaceIdentity = `${identity.dev}:${identity.ino}`;
         enableTrustedTools();
+        policyReady = true;
         ctx.ui.setStatus("ghostty-policy", "ready");
       });
 
-      pi.on("before_agent_start", () => { enableTrustedTools(); toolCalls = 0; taskStarted = Date.now(); });
+      // The native host arms only a real human wire message. Consume it before
+      // selected extensions transform input; private reviews do not renew quota.
+      pi.registerCommand(segmentCommand, { description: "Private Ghostty human-work-segment handshake", handler: async (argument) => {
+        if (!policyReady || !/^[a-f0-9]{64}$/.test(argument)) throw new Error("Invalid Ghostty diagnostic-segment handshake.");
+        segmentHash = argument;
+        segmentDeadline = Date.now() + 30000;
+      } });
+      pi.on("input", (event, ctx) => {
+        if (!["interactive", "rpc"].includes(event.source) || !event.text?.trim() || event.text.startsWith("/_ghostty_")) return;
+        const expected = segmentHash;
+        segmentHash = undefined;
+        if (!expected || Date.now() > segmentDeadline || digest(event.text) !== expected) return;
+        toolCalls = 0;
+        budgetSummary = false;
+        summaryTurn = false;
+        ctx.ui.setStatus?.("ghostty-diagnostics", "ready");
+      });
+      pi.on("before_agent_start", enableTrustedTools);
+      pi.on("turn_start", () => { if (budgetSummary) summaryTurn = true; });
+      pi.on("turn_end", (_event, ctx) => { if (summaryTurn && !ctx.hasPendingMessages()) ctx.abort(); });
+      pi.on("context_with_system", (event) => {
+        if (!budgetSummary) return;
+        const toolsRemoved = [...new Set(event.messages.flatMap((message) => (message.toolsAdded ?? []).map((tool) => tool.name)))].map((name) => ({ name }));
+        return { messages: [...event.messages, { role: "system", content: "The tool-call budget is exhausted. Give a concise evidence summary and ask the user whether to continue; do not call tools.", toolsRemoved, timestamp: Date.now() }] };
+      });
       // Keep both model-issued and user-issued routes closed to unregistered tools.
-      pi.on("tool_call", (event) => {
+      pi.on("tool_call", (event, ctx) => {
         // Native MCP discovers tools asynchronously, including after a turn starts.
         if (!commandMode && !names.has(event.toolName) && pi.getAllTools?.().some((tool) => tool.name === event.toolName && isNativeMcpTool(tool))) names.add(event.toolName);
         if (!names.has(event.toolName)) return { block: true, reason: "This tool is not enabled in the Ghostty task." };
-        // Extension commands can call tools before Pi starts an agent turn.
-        if (taskStarted === 0) taskStarted = Date.now();
-        if (++toolCalls > 40 || Date.now() - taskStarted > 10 * 60 * 1000) {
-          return { block: true, reason: "The task reached its diagnostic limit. Summarize the evidence and ask the user how to continue.", terminate: true };
+        // Count attempts, not time spent thinking, awaiting approval or running
+        // an admitted diagnostic command. Leave one tool-free turn to summarize.
+        if (++toolCalls > 40) {
+          const terminate = budgetSummary;
+          budgetSummary = true;
+          if (!terminate) ctx?.ui?.setStatus?.("ghostty-diagnostics", "paused");
+          return { block: true, reason: "The investigation reached its 40-tool-call limit. Tools are paused until the user continues. Summarize the evidence and ask the user how to continue.", ...(terminate ? { terminate: true } : {}) };
         }
       });
       pi.on("user_bash", () => ({
@@ -297,16 +335,29 @@ enum TerminalAIPolicy {
 
       pi.registerTool({
         name: "ghostty_task_plan", label: "Update investigation", executionMode: "sequential",
-        description: "Show a concise investigation plan before a multi-step diagnosis. Set stable step IDs, update each step while investigating, and report verification with references to real command IDs returned by ghostty_terminal. Evidence must describe observed output. Do not claim a repair was verified without a completed verification command. This tool updates the UI and never executes a command.",
+        description: "Read the current investigation with get_plan, including its actual step IDs and statuses. set_plan replaces all steps with 1–12 stable IDs and resets their status to pending. update_step requires an existing stepId and status pending, running, completed or failed; read get_plan again after continuing a conversation or if an ID is rejected. verify requires status passed or failed and commandIds returned by real completed ghostty_terminal runs. Evidence must describe observed output. Do not claim a repair was verified without a completed verification command. This tool reads or updates the UI and never executes a command.",
         parameters: Type.Object({
-          operation: Type.Union([Type.Literal("set_plan"), Type.Literal("update_step"), Type.Literal("verify")]),
+          operation: Type.Union([Type.Literal("get_plan"), Type.Literal("set_plan"), Type.Literal("update_step"), Type.Literal("verify")]),
           title: Type.Optional(Type.String()),
-          steps: Type.Optional(Type.Array(Type.Object({ id: Type.String(), title: Type.String() }), { maxItems: 12 })),
-          stepId: Type.Optional(Type.String()), status: Type.Optional(Type.String()),
+          steps: Type.Optional(Type.Array(Type.Object({ id: Type.String({ minLength: 1, maxLength: 100 }), title: Type.String({ minLength: 1, maxLength: 300 }) }), { minItems: 1, maxItems: 12 })),
+          stepId: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
+          status: Type.Optional(Type.Union(["pending", "running", "completed", "failed", "passed"].map(value => Type.Literal(value)))),
           evidence: Type.Optional(Type.String()), commandIds: Type.Optional(Type.Array(Type.String())),
           summary: Type.Optional(Type.String()),
         }),
-        async execute(_id, params, signal, _onUpdate, ctx) { return nativeBridge("ghostty-task-plan-v1", params, signal, ctx); },
+        async execute(_id, params, signal, _onUpdate, ctx) {
+          if (params.operation === "set_plan" && (!Array.isArray(params.steps) || params.steps.length < 1 || params.steps.length > 12)) throw new Error("set_plan requires 1–12 steps with unique IDs and titles.");
+          if (params.operation === "update_step" && (!params.stepId || !["pending", "running", "completed", "failed"].includes(params.status))) throw new Error("update_step requires an existing stepId and status pending, running, completed or failed. Use get_plan to read current IDs.");
+          if (params.operation === "verify" && (!["passed", "failed"].includes(params.status) || !Array.isArray(params.commandIds) || params.commandIds.length < 1 || params.commandIds.length > 12)) throw new Error("verify requires status passed or failed and 1–12 actual completed commandIds.");
+          const response = await nativeBridge("ghostty-task-plan-v1", params, signal, ctx);
+          const task = response.details.task;
+          if (task && Array.isArray(task.steps)) {
+            const state = { id: task.id, title: task.title, host: task.host, steps: task.steps.map(({ id, title, status }) => ({ id, title, status })),
+              verification: { status: task.verification?.status, summary: task.verification?.summary } };
+            response.content.push({ type: "text", text: `Current investigation plan:\n${JSON.stringify(state)}` });
+          }
+          return response;
+        },
       });
 
       pi.registerTool({

@@ -1,5 +1,5 @@
-:root { color-scheme: dark; --bg:#1e1e1e; --surface:#262626; --code:#181818; --fg:#e9e9e9; --muted:#b0b0b0; --border:#424242; --accent:#9ebcff; --accent-bg:#294263; --error:#ffaaa4; --focus:#a9c5ff; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:13px; line-height:1.5; }
-:root[data-appearance="light"] { color-scheme:light; --bg:#f6f6f6; --surface:#ececec; --code:#fff; --fg:#242424; --muted:#626262; --border:#c9c9c9; --accent:#214f8e; --accent-bg:#dce9fc; --error:#a92826; --focus:#24589f; }
+:root { color-scheme: dark; --bg:#1e1e1e; --surface:#262626; --code:#181818; --fg:#e9e9e9; --muted:#b0b0b0; --border:#424242; --accent:#9ebcff; --accent-bg:#294263; --user-bg:#263347; --user-border:#465d7d; --user-selection:#466793; --error:#ffaaa4; --focus:#a9c5ff; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; font-size:13px; line-height:1.5; }
+:root[data-appearance="light"] { color-scheme:light; --bg:#f6f6f6; --surface:#ececec; --code:#fff; --fg:#242424; --muted:#626262; --border:#c9c9c9; --accent:#214f8e; --accent-bg:#dce9fc; --user-bg:#e5eefb; --user-border:#acc3e5; --user-selection:#83afe9; --error:#a92826; --focus:#24589f; }
 * { box-sizing:border-box; }
 html,body,#root { width:100%; height:100%; margin:0; overflow:hidden; background:var(--bg); color:var(--fg); }
 button,textarea,select,input { font:inherit; color:inherit; }
@@ -35,6 +35,11 @@ textarea::placeholder { color:var(--muted); opacity:1; }
 .message { display:grid; grid-template-columns:32px minmax(0,1fr); gap:8px; }
 .message-content { min-width:0; }
 .message-role { font-size:11px; color:var(--muted); font-weight:600; padding-top:2px; }
+.user-message { padding:10px 12px; margin-top:16px; margin-bottom:14px; border:1px solid var(--user-border); border-radius:12px; background:var(--user-bg); }
+.user-message:first-child { margin-top:2px; }
+.user-message .message-role { font-size:12px; font-weight:700; color:var(--accent); padding-top:0; }
+.user-message .user-text { font-weight:500; }
+.user-message ::selection { background:var(--user-selection); color:var(--fg); }
 .user-text { white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
 .empty-state { padding-top:4px; }
 .empty-state strong { font-weight:500; }

@@ -31,7 +31,7 @@ struct TerminalAIModelTests {
         #expect(assistant.configurationIssue == nil)
         #expect(assistant.canSubmit)
         assistant.submit()
-        let prompt = try #require(commands.first { $0["type"] as? String == "prompt" })
+        let prompt = try #require(humanPrompts(commands).first)
         #expect((prompt["message"] as? String)?.contains("Example error output") == true)
         #expect(!assistant.canSubmit)
         assistant.receive(["type": "agent_settled"])
@@ -66,7 +66,7 @@ struct TerminalAIModelTests {
         assistant.prompt = "Investigate"
         assistant.submit()
         #expect(assistant.isRunning)
-        let prompt = commands.first { $0["type"] as? String == "prompt" }
+        let prompt = humanPrompts(commands).first
         assistant.receive(["type": "response", "id": prompt?["id"] ?? "", "success": true])
         #expect(assistant.isRunning)
         assistant.receive(["type": "message_start", "message": ["role": "assistant"]])
@@ -84,6 +84,96 @@ struct TerminalAIModelTests {
         #expect(assistant.isRunning)
         assistant.receive(["type": "agent_settled"])
         #expect(!assistant.isRunning)
+    }
+
+    @Test func diagnosticSegmentsBindFrozenHumanWireAndRemainPrivate() throws {
+        var commands: [[String: Any]] = []
+        let assistant = makeModel { commands.append($0) }
+        assistant.sendInput("调查 CPU 中文")
+        #expect(commands.count == 2)
+        let initial = try #require(humanPrompts(commands).first)
+        let wire = try #require(initial["message"] as? String)
+        let segment = commands[0]
+        #expect(segment["type"] as? String == "prompt")
+        #expect(segment["message"] as? String == "/_ghostty_begin_work_segment \(TerminalAIApprovalReview.sha256(Data(wire.utf8)))")
+        #expect(segment["streamingBehavior"] == nil)
+        #expect(segment["id"] as? String != initial["id"] as? String)
+        let before = try JSONSerialization.data(withJSONObject: assistant.webSnapshot, options: [.sortedKeys])
+        assistant.receive(["type": "response", "id": segment["id"] ?? "", "success": true, "data": ["disposition": "handled"]])
+        #expect(assistant.isRunning)
+        #expect(assistant.error == nil)
+        #expect(commands.count == 2, "A private acknowledgement must not request state or finish the main prompt")
+        #expect(try JSONSerialization.data(withJSONObject: assistant.webSnapshot, options: [.sortedKeys]) == before)
+        assistant.receive(["type": "response", "id": segment["id"] ?? "", "success": false])
+        #expect(assistant.error == nil, "A consumed private response must not affect another request")
+        assistant.sendInput("继续检查进程", mode: "steer")
+        #expect(commands.count == 4)
+        #expect(commands[2]["message"] as? String == "/_ghostty_begin_work_segment \(TerminalAIApprovalReview.sha256(Data("继续检查进程".utf8)))")
+        #expect(commands[3]["message"] as? String == "继续检查进程")
+        #expect(commands[3]["streamingBehavior"] as? String == "steer")
+        assistant.receive(["type": "response", "id": commands[2]["id"] ?? "", "success": true, "data": ["disposition": "handled"]])
+        #expect((assistant.webSnapshot["queuedInputs"] as? [[String: String]])?.isEmpty == true)
+        #expect(assistant.messages.filter { $0.role == "user" }.count == 1)
+        #expect(!assistant.response.contains("/_ghostty_begin_work_segment"))
+        assistant.receive(["type": "response", "id": commands[3]["id"] ?? "", "success": true, "data": ["disposition": "queued"]])
+        #expect((assistant.webSnapshot["queuedInputs"] as? [[String: String]])?.first?["text"] == "继续检查进程")
+    }
+
+    @Test func failedOrUnhandledDiagnosticHandshakeStopsTheMainTask() throws {
+        let responses: [[String: Any]] = [
+            ["success": false, "error": "Private command failed"],
+            ["success": true],
+            ["success": true, "data": ["disposition": "started"]],
+            ["success": true, "data": ["disposition": "queued"]],
+            ["data": ["disposition": "handled"]]
+        ]
+        for response in responses {
+            var commands: [[String: Any]] = []
+            let assistant = makeModel { commands.append($0) }
+            assistant.sendInput("A real human request")
+            let segment = try #require(commands.first)
+            var record = response
+            record["type"] = "response"
+            record["id"] = segment["id"]
+            assistant.receive(record)
+            #expect(assistant.error?.contains("Pi could not start a diagnostic work segment") == true)
+            #expect(assistant.phase == .failed)
+            #expect(!assistant.isRunning)
+            #expect((assistant.webSnapshot["queuedInputs"] as? [[String: String]])?.isEmpty == true)
+            #expect(!assistant.response.contains("/_ghostty_begin_work_segment"))
+        }
+    }
+
+    @Test func diagnosticPauseSettlesWithContinueHintAndHumanReadinessClearsIt() throws {
+        var commands: [[String: Any]] = []
+        let assistant = makeModel { commands.append($0) }
+        assistant.sendInput("Investigate")
+        assistant.receive(["type": "extension_ui_request", "id": "budget-paused", "method": "setStatus",
+                           "statusKey": "ghostty-diagnostics", "statusText": "paused"])
+        assistant.receive(["type": "agent_end"])
+        #expect(assistant.isRunning, "Wait for authoritative settlement after the tool-free summary")
+        assistant.receive(["type": "agent_settled"])
+        #expect(!assistant.isRunning)
+        #expect(assistant.phase == .stopped)
+        #expect(assistant.statusLabel == "Paused · Send a message to continue")
+        #expect(assistant.error == nil)
+        assistant.prompt = "请继续"
+        #expect(assistant.canSubmit)
+        assistant.receive(["type": "extension_ui_request", "id": "late-ready", "method": "setStatus",
+                           "statusKey": "ghostty-diagnostics", "statusText": "ready"])
+        #expect(assistant.phase == .stopped, "Stale readiness cannot restart a settled task")
+        assistant.sendInput("请继续")
+        #expect(assistant.isRunning)
+        #expect((humanPrompts(commands).last?["message"] as? String)?.contains("请继续") == true)
+        assistant.receive(["type": "extension_ui_request", "id": "another-pause", "method": "setStatus",
+                           "statusKey": "ghostty-diagnostics", "statusText": "paused"])
+        assistant.receive(["type": "extension_ui_request", "id": "human-ready", "method": "setStatus",
+                           "statusKey": "ghostty-diagnostics", "statusText": "ready"])
+        assistant.receive(["type": "agent_settled"])
+        #expect(!assistant.isRunning)
+        #expect(assistant.phase == .completed)
+        #expect(assistant.statusLabel == "Completed")
+        #expect(assistant.error == nil)
     }
 
     @Test func rejectionAndStopNeverApprovePendingCommand() {
@@ -128,7 +218,7 @@ struct TerminalAIModelTests {
         #expect(assistant.toolExecutions.first?.output == "complete")
         #expect(assistant.toolExecutions.first?.isRunning == false)
         #expect(assistant.suggestedCommand == "lsof -i :8080")
-        assistant.receive(["type": "response", "id": commands[0]["id"] ?? "", "success": false, "error": "bad model"])
+        assistant.receive(["type": "response", "id": humanPrompts(commands).first?["id"] ?? "", "success": false, "error": "bad model"])
         #expect(assistant.error == "bad model")
         #expect(!assistant.isRunning)
     }
@@ -329,7 +419,7 @@ struct TerminalAIModelTests {
         #expect(assistant.configurationIssue == nil)
         assistant.submit()
         #expect(assistant.isRunning)
-        let prompt = try #require(commands.first { $0["type"] as? String == "prompt" })
+        let prompt = try #require(humanPrompts(commands).first)
         #expect((prompt["message"] as? String)?.contains("fixture error output") == true)
     }
 
@@ -419,6 +509,10 @@ struct TerminalAIModelTests {
                                   'success':True, 'data':{'model':{'provider':'fixture-active',
                                                                 'id':'fixture-active-model'}}}), flush=True)
             elif request['type'] == 'prompt':
+                if request.get('message', '').startswith('/_ghostty_begin_work_segment '):
+                    print(json.dumps({'type':'response', 'id':request['id'], 'success':True,
+                                      'data':{'disposition':'handled'}}), flush=True)
+                    continue
                 print(json.dumps({'type':'agent_settled'}), flush=True)
         """
         try Data(fixture.utf8).write(to: script)
@@ -509,16 +603,16 @@ struct TerminalAIModelTests {
         var commands: [[String: Any]] = []
         let assistant = makeModel { commands.append($0) }
         assistant.sendInput("Initial question")
-        let initial = try #require(commands.first?["message"] as? String)
+        let initial = try #require(humanPrompts(commands).first?["message"] as? String)
         assistant.receive(["type": "message_start", "message": ["role": "user", "timestamp": 1, "content": initial]])
         assistant.receive(["type": "message_end", "message": ["role": "user", "timestamp": 1, "content": initial]])
         #expect(assistant.messages.count == 1)
         #expect(assistant.response == "You: Initial question")
         assistant.sendInput("Investigate the port instead", mode: "steer")
         assistant.sendInput("Then summarize", mode: "follow_up")
-        #expect(commands.suffix(2).compactMap { $0["type"] as? String } == ["prompt", "prompt"])
-        #expect(commands.suffix(2).compactMap { $0["streamingBehavior"] as? String } == ["steer", "followUp"])
-        for command in commands.suffix(2) {
+        #expect(humanPrompts(commands).suffix(2).compactMap { $0["type"] as? String } == ["prompt", "prompt"])
+        #expect(humanPrompts(commands).suffix(2).compactMap { $0["streamingBehavior"] as? String } == ["steer", "followUp"])
+        for command in humanPrompts(commands).suffix(2) {
             assistant.receive(["type": "response", "id": command["id"] ?? "", "success": true])
         }
         #expect((assistant.webSnapshot["queuedInputs"] as? [[String: String]])?.count == 2)
@@ -568,7 +662,7 @@ struct TerminalAIModelTests {
         var commands: [[String: Any]] = []
         let assistant = makeModel { commands.append($0) }
         assistant.sendInput("First task")
-        #expect(commands.first?["streamingBehavior"] as? String == "followUp")
+        #expect(humanPrompts(commands).first?["streamingBehavior"] as? String == "followUp")
         assistant.sendInput("Second task", mode: "follow_up")
         let second = try #require(commands.last)
         assistant.receive(["type": "response", "id": second["id"] ?? "", "success": true])
@@ -608,8 +702,8 @@ struct TerminalAIModelTests {
         model.prompt = "Original submitted question"
         model.submit()
         #expect(model.prompt == "New draft typed while Pi starts")
-        #expect((commands.first?["message"] as? String)?.contains("Original submitted question") == true)
-        #expect((commands.first?["message"] as? String)?.contains("New draft typed while Pi starts") == false)
+        #expect((humanPrompts(commands).first?["message"] as? String)?.contains("Original submitted question") == true)
+        #expect((humanPrompts(commands).first?["message"] as? String)?.contains("New draft typed while Pi starts") == false)
         #expect(model.response == "You: Original submitted question")
         model.sendInput("Queued submitted question", mode: "follow_up")
         #expect(model.prompt == "New draft typed while Pi starts")
@@ -741,7 +835,7 @@ struct TerminalAIModelTests {
         assistant.prompt = "Inspect this terminal"
         assistant.submit()
         #expect(assistant.terminalControlAllowed)
-        let submitted = try #require(wire.first { $0["type"] as? String == "prompt" }?["message"] as? String)
+        let submitted = try #require(humanPrompts(wire).first?["message"] as? String)
         #expect(submitted.contains("ATTACHED terminal"))
         #expect(submitted.contains("Every run executes visibly in that attached shell"))
         #expect(!submitted.contains("LOCAL host"))
@@ -901,6 +995,10 @@ struct TerminalAIModelTests {
         #expect(input.contains("will not overwrite"))
         #expect(missing.contains("open a new terminal"))
         #expect(TerminalAIModel.promptIssue(status: GHOSTTY_PROMPT_READY, readonly: true)?.contains("read-only") == true)
+    }
+
+    private func humanPrompts(_ commands: [[String: Any]]) -> [[String: Any]] {
+        commands.filter { $0["type"] as? String == "prompt" && !($0["message"] as? String ?? "").hasPrefix("/_ghostty_") }
     }
 
     private func makeModel(

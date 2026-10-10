@@ -170,6 +170,106 @@ struct TerminalAIWorkbenchTests {
         #expect(plan.verification.evidence.contains(fresh.id))
     }
 
+    @Test func readingTaskPlanPreservesItsIdentityProgressAndVerification() throws {
+        let surface = UUID()
+        var plan = task(surface: surface)
+        try plan.apply(["operation": "update_step", "stepId": "inspect", "status": "completed", "evidence": "Observed output"], records: [])
+        let check = try record(surface: surface)
+        try plan.apply(["operation": "verify", "status": "passed", "commandIds": [check.id], "summary": "Checked result"], records: [check])
+        let before = plan
+        try plan.apply(["operation": "get_plan"], records: [])
+        #expect(plan == before)
+        let context = plan.modelContext
+        #expect(context.contains("Current investigation plan:"))
+        let stateText = try #require(context.split(separator: "\n", maxSplits: 1).last)
+        let state = try #require(JSONSerialization.jsonObject(with: Data(stateText.utf8)) as? [String: Any])
+        #expect(state["id"] as? String == plan.id.uuidString)
+        let steps = try #require(state["steps"] as? [[String: String]])
+        #expect(steps.first?["id"] == "inspect")
+        #expect(steps.first?["status"] == "completed")
+        #expect(steps.first?["evidence"] == nil)
+        #expect((state["verification"] as? [String: String])?["status"] == "passed")
+    }
+
+    @Test func taskPlanErrorsDistinguishMissingIDsFromInvalidStatusWithoutChangingProgress() throws {
+        var plan = task(surface: UUID())
+        let before = plan
+        do {
+            try plan.apply(["operation": "update_step", "stepId": "transient", "status": "completed"], records: [])
+            Issue.record("An undeclared step was accepted")
+        } catch {
+            #expect(error.localizedDescription.contains("Unknown step ID \"transient\""))
+            #expect(error.localizedDescription.contains("Existing step IDs: inspect"))
+        }
+        #expect(plan == before)
+        for invalid in ["in_progress", "done", "passed"] {
+            do {
+                try plan.apply(["operation": "update_step", "stepId": "inspect", "status": invalid], records: [])
+                Issue.record("An invalid status was accepted")
+            } catch {
+                #expect(error.localizedDescription == "update_step requires status: pending, running, completed, failed.")
+            }
+            #expect(plan == before)
+        }
+        #expect(throws: (any Error).self) { try plan.apply(["operation": "update_step", "status": "completed"], records: []) }
+        #expect(plan == before)
+    }
+
+    @Test func taskPlanAcceptsDeclaredScreenshotStepAndBoundsVisibleStateWithoutDiscardingEvidence() throws {
+        var plan = task(surface: UUID())
+        try plan.apply(["operation": "set_plan", "steps": [["id": "transient", "title": "追踪短命进程"]]], records: [])
+        try plan.apply(["evidence": String(repeating: "中", count: 9_000), "operation": "update_step", "status": "completed",
+                        "stepId": "transient", "summary": "额外的总结字段不改变步骤状态"], records: [])
+        #expect(plan.steps.first?.status == "completed")
+        #expect(plan.steps.first?.evidence.count == 8_192)
+        #expect(plan.modelContext.utf8.count < 2_048)
+        #expect(plan.modelContext.contains("transient"))
+        #expect(!plan.modelContext.contains(String(repeating: "中", count: 100)))
+    }
+
+    @Test func taskVerificationRejectsOtherOrUnknownHostsOnTheSameSurface() throws {
+        let surface = UUID()
+        var plan = task(surface: surface)
+        let same = try record(surface: surface, sequence: 1, host: "fixture-host")
+        let other = try record(surface: surface, sequence: 2, host: "other-host")
+        let missing = try record(surface: surface, sequence: 3, host: nil)
+        for invalid in [other, missing] {
+            #expect(throws: (any Error).self) {
+                try plan.apply(["operation": "verify", "status": "passed", "commandIds": [invalid.id]], records: [invalid])
+            }
+            #expect(plan.verification.status == "pending")
+        }
+        try plan.apply(["operation": "verify", "status": "passed", "commandIds": [same.id]], records: [same])
+        #expect(plan.verification.status == "passed")
+        #expect(plan.verification.evidence.contains("Reported host: fixture-host"))
+        for unknown in [nil, "unknown", ""] as [String?] {
+            plan.host = unknown
+            plan.verification = .init()
+            #expect(throws: (any Error).self) {
+                try plan.apply(["operation": "verify", "status": "passed", "commandIds": [same.id]], records: [same])
+            }
+            #expect(plan.verification.status == "pending")
+        }
+    }
+
+    @Test func legacyTaskPlanWithoutAHostRemainsReadableButCannotVerifyNewCommands() throws {
+        let surface = UUID()
+        let original = task(surface: surface)
+        let data = try JSONEncoder().encode(original)
+        var legacy = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        legacy.removeValue(forKey: "host")
+        var recovered = try JSONDecoder().decode(TerminalAITaskPlan.self, from: JSONSerialization.data(withJSONObject: legacy))
+        #expect(recovered.host == nil)
+        #expect(recovered.id == original.id)
+        #expect(recovered.surfaceID == original.surfaceID)
+        #expect(recovered.steps == original.steps)
+        let command = try record(surface: surface)
+        #expect(throws: (any Error).self) {
+            try recovered.apply(["operation": "verify", "status": "passed", "commandIds": [command.id]], records: [command])
+        }
+        #expect(recovered.verification.status == "pending")
+    }
+
     private struct Fixture {
         let root: URL
         let store: TerminalAIWorkbenchStore
@@ -192,14 +292,16 @@ struct TerminalAIWorkbenchTests {
     }
 
     private func task(surface: UUID) -> TerminalAITaskPlan {
-        .init(id: UUID(), title: "Repair build", surfaceID: surface, startedAt: 100, steps: [.init(id: "inspect", title: "Inspect error")])
+        .init(id: UUID(), title: "Repair build", surfaceID: surface, host: "fixture-host", startedAt: 100,
+              steps: [.init(id: "inspect", title: "Inspect error")])
     }
 
-    private func record(surface: UUID, sequence: UInt64 = 1, started: Double = 101, output: String = "fixture output", exit: Int? = 0,
+    private func record(surface: UUID, sequence: UInt64 = 1, started: Double = 101, host: String? = "fixture-host", output: String = "fixture output", exit: Int? = 0,
                         running: Bool = false, interrupted: Bool = false, finished: Bool = true) throws -> TerminalAICommandRecord {
         var value: [String: Any] = ["sequence": sequence, "startedAt": started, "command": "make test", "commandSource": "shell_integration",
-                                    "directory": "/fixture/project", "host": "fixture-host", "hostIsLocal": false,
+                                    "directory": "/fixture/project", "hostIsLocal": false,
                                     "durationMs": UInt64(1_000), "running": running, "interrupted": interrupted, "output": output]
+        if let host { value["host"] = host }
         if let exit { value["exitCode"] = exit }
         if finished && !running { value["finishedAt"] = started + 1 }
         return try #require(TerminalAICommandRecord(value: value, surfaceID: surface))

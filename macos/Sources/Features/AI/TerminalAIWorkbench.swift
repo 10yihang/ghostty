@@ -173,6 +173,8 @@ struct TerminalAIWorkflow: Codable, Identifiable, Equatable {
 }
 
 struct TerminalAITaskPlan: Codable, Identifiable, Equatable {
+    static let stepStatuses = ["pending", "running", "completed", "failed"]
+
     struct Step: Codable, Identifiable, Equatable {
         let id: String
         let title: String
@@ -187,19 +189,33 @@ struct TerminalAITaskPlan: Codable, Identifiable, Equatable {
     let id: UUID
     var title: String
     let surfaceID: UUID
+    var host: String?
     let startedAt: Double
     var startSequence: UInt64?
     var steps: [Step]
     var verification = Verification()
 
     var webValue: [String: Any] {
-        ["id": id.uuidString, "title": title,
+        var value: [String: Any] = ["id": id.uuidString, "title": title,
          "steps": steps.map { ["id": $0.id, "title": $0.title, "status": $0.status, "evidence": $0.evidence] },
          "verification": ["status": verification.status, "summary": verification.summary, "evidence": verification.evidence]]
+        if let host { value["host"] = host }
+        return value
+    }
+
+    var modelContext: String {
+        let state: [String: Any] = [
+            "id": id.uuidString, "title": title, "host": host ?? "unknown",
+            "steps": steps.map { ["id": $0.id, "title": $0.title, "status": $0.status] },
+            "verification": ["status": verification.status, "summary": verification.summary]
+        ]
+        let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])
+        return "Current investigation plan:\n" + (data.flatMap { String(data: $0, encoding: .utf8) } ?? "Unavailable")
     }
 
     mutating func apply(_ request: [String: Any], records: [TerminalAICommandRecord]) throws {
         switch request["operation"] as? String {
+        case "get_plan": break
         case "set_plan":
             guard let proposed = request["steps"] as? [[String: Any]], (1...12).contains(proposed.count) else {
                 throw TerminalAIWorkflow.issue("Provide 1–12 troubleshooting steps.")
@@ -216,9 +232,14 @@ struct TerminalAITaskPlan: Codable, Identifiable, Equatable {
             if let title = request["title"] as? String, !title.isEmpty { self.title = String(title.prefix(300)) }
             verification = Verification()
         case "update_step":
-            guard let id = request["stepId"] as? String, let index = steps.firstIndex(where: { $0.id == id }),
-                  let status = request["status"] as? String, ["pending", "running", "completed", "failed"].contains(status) else {
-                throw TerminalAIWorkflow.issue("Choose an existing step and a valid status.")
+            guard let id = request["stepId"] as? String, !id.isEmpty else {
+                throw TerminalAIWorkflow.issue("update_step requires stepId. Read get_plan for the existing step IDs.")
+            }
+            guard let index = steps.firstIndex(where: { $0.id == id }) else {
+                throw TerminalAIWorkflow.issue("Unknown step ID \(String(reflecting: String(id.prefix(100)))). Existing step IDs: \(steps.map(\.id).joined(separator: ", ")).")
+            }
+            guard let status = request["status"] as? String, Self.stepStatuses.contains(status) else {
+                throw TerminalAIWorkflow.issue("update_step requires status: \(Self.stepStatuses.joined(separator: ", ")).")
             }
             steps[index].status = status
             steps[index].evidence = String((request["evidence"] as? String ?? "").prefix(8_192))
@@ -236,6 +257,12 @@ struct TerminalAITaskPlan: Codable, Identifiable, Equatable {
                     throw TerminalAIWorkflow.issue("Verification must reference completed commands from this task's attached terminal.")
                 }
                 return record
+            }
+            guard let host, !host.isEmpty, host != "unknown" else {
+                throw TerminalAIWorkflow.issue("Verification requires a known host bound to this task. Continue the task to refresh the terminal target.")
+            }
+            guard checks.allSatisfy({ $0.host == host }) else {
+                throw TerminalAIWorkflow.issue("Verification must reference commands from this task's attached host.")
             }
             if status == "passed", checks.contains(where: { $0.exitCode != 0 }) {
                 throw TerminalAIWorkflow.issue("A failed command cannot prove a passed verification.")

@@ -186,10 +186,10 @@ const userParts = { Text: UserText };
 const assistantParts = { Text: Markdown, tools: { Fallback: ToolCard }, Empty: () => null };
 const convertMessage = (message: NativeMessage): ThreadMessageLike => ({ id: message.id, role: message.role, content: message.content });
 function UserMessage() {
-  return <MessagePrimitive.Root className="message user-message"><div className="message-role">You</div><div className="message-content"><MessagePrimitive.Parts components={userParts} /></div></MessagePrimitive.Root>;
+  return <MessagePrimitive.Root className="message user-message" aria-label="Your message"><div className="message-role">You</div><div className="message-content"><MessagePrimitive.Parts components={userParts} /></div></MessagePrimitive.Root>;
 }
 function AssistantMessage() {
-  return <MessagePrimitive.Root className="message assistant-message"><div className="message-role">AI</div><div className="message-content"><MessagePrimitive.Parts components={assistantParts} /></div></MessagePrimitive.Root>;
+  return <MessagePrimitive.Root className="message assistant-message" aria-label="AI reply"><div className="message-role">AI</div><div className="message-content"><MessagePrimitive.Parts components={assistantParts} /></div></MessagePrimitive.Root>;
 }
 
 function RunStatus({ snapshot }: { snapshot: Snapshot }) {

@@ -272,6 +272,134 @@ struct TerminalAIHistoryModelTests {
         #expect(reader.reset())
     }
 
+    @Test func continuationReloadsLatestTaskAfterTheWriterLeaseAndPreservesLocalAttachmentDrafts() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let surface = UUID()
+        let owner = fixture.makeModel(surfaceID: surface)
+        owner.prompt = "Inspect fixture"
+        owner.submit()
+        try fixture.requestPlan(owner, id: "original-plan", payload: [
+            "operation": "set_plan", "steps": [["id": "original", "title": "Original plan snapshot"]]
+        ])
+        fixture.complete(owner)
+        let id = owner.conversationID
+        try fixture.writePiContext(id)
+        let reader = fixture.makeModel(surfaceID: surface)
+        #expect(reader.openConversation(id))
+        #expect(reader.taskPlan?.steps.map(\.id) == ["original"])
+        let draft = fixture.directory.appendingPathComponent("reader-draft.txt")
+        try "Explicit reader attachment".write(to: draft, atomically: true, encoding: .utf8)
+        reader.attachContext(kind: "file", path: draft.path)
+        let attached = reader.attachments
+        #expect(attached.count == 1)
+        reader.prompt = "请继续"
+        reader.submit()
+        #expect(!reader.isRunning)
+        #expect(reader.error?.contains("another AI panel") == true)
+        owner.prompt = "请继续"
+        owner.submit()
+        try fixture.requestPlan(owner, id: "latest-plan", payload: [
+            "operation": "set_plan", "steps": [["id": "transient", "title": "Latest short-lived process plan"]]
+        ])
+        try fixture.requestPlan(owner, id: "latest-evidence", payload: [
+            "operation": "update_step", "stepId": "transient", "status": "completed", "evidence": "Latest owner evidence"
+        ])
+        fixture.complete(owner, text: "Latest owner result")
+        let latest = try #require(owner.taskPlan)
+        #expect(owner.reset())
+        #expect(reader.taskPlan?.steps.map(\.id) == ["original"])
+        reader.submit()
+        #expect(reader.isRunning)
+        let continued = try #require(reader.taskPlan)
+        #expect(continued.id == latest.id)
+        #expect(continued.steps == latest.steps)
+        #expect(continued.startedAt == latest.startedAt)
+        #expect(continued.startSequence == latest.startSequence)
+        #expect(reader.attachments == attached)
+        let prompt = try #require(fixture.commands.last { $0["type"] as? String == "prompt" }?["message"] as? String)
+        #expect(prompt.contains("\"id\":\"transient\""))
+        #expect(prompt.contains("Explicit reader attachment"))
+        try fixture.requestPlan(reader, id: "continued-plan", payload: [
+            "operation": "update_step", "stepId": "transient", "status": "completed", "evidence": "Reader follow-up evidence"
+        ])
+        #expect(reader.taskPlan?.steps.first?.evidence == "Reader follow-up evidence")
+        fixture.complete(reader)
+        #expect(reader.reset())
+    }
+
+    @Test func continuingHistoryOnAnotherSurfaceDoesNotReuseThePreviousPassedVerification() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let owner = fixture.makeModel()
+        owner.prompt = "Original verified task"
+        owner.submit()
+        fixture.complete(owner)
+        let id = owner.conversationID
+        var previous = try #require(owner.taskPlan)
+        previous.host = "previous-host"
+        previous.verification = .init(status: "passed", summary: "Earlier terminal passed its recorded check", evidence: "Earlier command record")
+        #expect(owner.reset())
+        let saved = try fixture.store.read(id: id)
+        let data = try JSONEncoder().encode(TerminalAISavedWorkbench(attachments: [], task: previous))
+        let workbench = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        try fixture.store.save(.init(entry: saved.entry, messages: saved.messages, phase: saved.phase, workbench: workbench))
+        try fixture.writePiContext(id)
+        let surface = UUID()
+        let reader = fixture.makeModel(surfaceID: surface)
+        #expect(reader.openConversation(id))
+        #expect(reader.taskPlan?.verification.status == "passed")
+        reader.prompt = "请继续"
+        reader.submit()
+        #expect(reader.isRunning)
+        let fresh = try #require(reader.taskPlan)
+        #expect(fresh.id != previous.id)
+        #expect(fresh.surfaceID == surface)
+        #expect(fresh.verification.status == "pending")
+        #expect(fresh.verification.evidence.isEmpty)
+        fixture.complete(reader)
+        #expect(reader.reset())
+    }
+
+    @Test func continuingHistoryOnTheSameSurfaceRefreshesDifferentOrMissingHostBindings() throws {
+        for storedHost in ["previous-host", nil] as [String?] {
+            let fixture = try Fixture()
+            defer { fixture.cleanUp() }
+            let surface = UUID()
+            let owner = fixture.makeModel(surfaceID: surface)
+            owner.prompt = "Previous terminal task"
+            owner.submit()
+            fixture.complete(owner)
+            let id = owner.conversationID
+            var previous = try #require(owner.taskPlan)
+            previous.host = storedHost
+            previous.steps = [.init(id: "transient", title: "Previous host investigation", status: "completed", evidence: "Previous host output")]
+            previous.verification = .init(status: "passed", summary: "Previous host checked", evidence: "Previous host command")
+            #expect(owner.reset())
+            let saved = try fixture.store.read(id: id)
+            let data = try JSONEncoder().encode(TerminalAISavedWorkbench(attachments: [], task: previous))
+            let workbench = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            try fixture.store.save(.init(entry: saved.entry, messages: saved.messages, phase: saved.phase, workbench: workbench))
+            try fixture.writePiContext(id)
+            let reader = fixture.makeModel(surfaceID: surface)
+            #expect(reader.openConversation(id))
+            #expect(reader.taskPlan?.id == previous.id)
+            #expect(reader.taskPlan?.host == storedHost)
+            reader.prompt = "请继续"
+            reader.submit()
+            #expect(reader.isRunning)
+            let fresh = try #require(reader.taskPlan)
+            #expect(fresh.surfaceID == previous.surfaceID)
+            #expect(fresh.id != previous.id)
+            #expect(fresh.host == "unknown")
+            #expect(fresh.steps.map(\.id) == ["inspect", "diagnose", "verify"])
+            #expect(fresh.verification.status == "pending")
+            #expect(fresh.verification.evidence.isEmpty)
+            fixture.complete(reader)
+            #expect(reader.reset())
+        }
+    }
+
     @Test func saveFailurePreservesConversationAndBlocksResetAndOpeningAnother() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -334,6 +462,16 @@ struct TerminalAIHistoryModelTests {
             model.receive(["type": "message_start", "message": ["role": "assistant"]])
             model.receive(["type": "message_end", "message": ["role": "assistant", "content": [["type": "text", "text": text]]]])
             model.receive(["type": "agent_settled"])
+        }
+
+        func requestPlan(_ model: TerminalAIModel, id: String, payload: [String: Any]) throws {
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            model.receive(["type": "extension_ui_request", "method": "input", "title": "ghostty-task-plan-v1", "id": id,
+                           "placeholder": try #require(String(data: data, encoding: .utf8))])
+            let result = try #require(commands.last { $0["type"] as? String == "extension_ui_response" && $0["id"] as? String == id })
+            let text = try #require(result["value"] as? String)
+            let value = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            #expect(value["error"] == nil)
         }
 
         func entry(_ id: UUID, count: Int) -> TerminalAIHistoryStore.Entry {

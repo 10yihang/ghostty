@@ -65,6 +65,8 @@ test("native snapshots render rich ordered content and preserve interaction duri
     assert.equal(document.querySelectorAll('a[href^="javascript:"]').length, 0);
     assert.equal(document.querySelectorAll('a[href^="https:"]').length, 1);
     const assistant = document.querySelector(".assistant-message");
+    assert.equal(document.querySelector(".user-message").getAttribute("aria-label"), "Your message");
+    assert.equal(assistant.getAttribute("aria-label"), "AI reply");
     assert.ok(assistant.textContent.indexOf("Before check") < assistant.textContent.indexOf("Check port"));
     assert.ok(assistant.textContent.indexOf("Check port") < assistant.textContent.indexOf("After check"));
     assert.equal(document.querySelector(".tool-state").textContent, "Running");

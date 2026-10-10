@@ -20,7 +20,7 @@ struct TerminalAIWorkbenchModelTests {
         }
         #expect(fixture.model.approval == nil)
         #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("forbidden").path))
-        #expect((fixture.recording.commands.first { $0["type"] as? String == "prompt" }?["message"] as? String)?.contains("do not execute anything") == true)
+        #expect((fixture.recording.humanPrompts.first?["message"] as? String)?.contains("do not execute anything") == true)
     }
 
     @Test func fileToolsAdvertiseTheirLocalScopeAndChangesRequireExactDiffApproval() async throws {
@@ -110,7 +110,7 @@ struct TerminalAIWorkbenchModelTests {
         fixture.model.attachContext(kind: "project", path: project.path)
         #expect(fixture.model.attachments.count == 3)
         fixture.begin("Inspect these attachments")
-        let sentPrompt = try #require(fixture.recording.commands.first { $0["type"] as? String == "prompt" }?["message"] as? String)
+        let sentPrompt = try #require(fixture.recording.humanPrompts.first?["message"] as? String)
         for attachment in fixture.model.attachments {
             #expect(sentPrompt.contains("<attachment id=\"\(attachment.id)\">"))
             #expect(sentPrompt.contains("Source: \(attachment.source)"))
@@ -190,6 +190,95 @@ struct TerminalAIWorkbenchModelTests {
         #expect(fixture.model.taskPlan?.verification.status == "pending")
         fixture.model.receive(["type": "agent_settled"])
         #expect(fixture.model.taskPlan?.verification.status == "unverified")
+    }
+
+    @Test func continuingAnIdleInvestigationPreservesCustomStepsEvidenceAndCommandBoundary() throws {
+        let fixture = try WorkbenchModelFixture()
+        defer { fixture.remove() }
+        fixture.begin("Investigate short-lived process")
+        try fixture.request(title: "ghostty-task-plan-v1", id: "custom", payload: [
+            "operation": "set_plan", "steps": [["id": "transient", "title": "Inspect short-lived process"]]
+        ])
+        try fixture.request(title: "ghostty-task-plan-v1", id: "observed", payload: [
+            "operation": "update_step", "stepId": "transient", "status": "completed", "evidence": "Recorded process output"
+        ])
+        fixture.model.receive(["type": "agent_settled"])
+        let before = try #require(fixture.model.taskPlan)
+        let conversation = fixture.model.conversationID
+        fixture.begin("请继续")
+        let continued = try #require(fixture.model.taskPlan)
+        #expect(fixture.model.conversationID == conversation)
+        #expect(continued.id == before.id)
+        #expect(continued.surfaceID == before.surfaceID)
+        #expect(continued.startedAt == before.startedAt)
+        #expect(continued.startSequence == before.startSequence)
+        #expect(continued.steps == before.steps)
+        let prompt = try #require(fixture.recording.commands.last { $0["type"] as? String == "prompt" }?["message"] as? String)
+        #expect(prompt.contains("Current investigation plan:"))
+        #expect(prompt.contains("\"id\":\"transient\""))
+        #expect(prompt.contains("\"status\":\"completed\""))
+        try fixture.request(title: "ghostty-task-plan-v1", id: "continued", payload: [
+            "operation": "update_step", "stepId": "transient", "status": "completed", "evidence": "Confirmed follow-up output"
+        ])
+        #expect(try fixture.response("continued")["error"] == nil)
+        #expect(fixture.model.taskPlan?.steps.first?.evidence == "Confirmed follow-up output")
+    }
+
+    @Test func readingNativePlanDoesNotMutateSavedHistoryAndErrorsReturnItsCurrentState() throws {
+        let fixture = try WorkbenchModelFixture()
+        defer { fixture.remove() }
+        fixture.begin("Read current investigation")
+        try fixture.request(title: "ghostty-task-plan-v1", id: "custom", payload: [
+            "operation": "set_plan", "steps": [["id": "transient", "title": "Inspect process"]]
+        ])
+        let plan = try #require(fixture.model.taskPlan)
+        let history = fixture.directory.appendingPathComponent("configuration/conversations/\(fixture.model.conversationID.uuidString)/conversation.json")
+        let saved = try Data(contentsOf: history)
+        try fixture.request(title: "ghostty-task-plan-v1", id: "read", payload: ["operation": "get_plan"])
+        #expect(fixture.model.taskPlan == plan)
+        #expect(try Data(contentsOf: history) == saved)
+        let read = try fixture.response("read")
+        let state = try #require(read["task"] as? [String: Any])
+        #expect(state["id"] as? String == plan.id.uuidString)
+        #expect((state["steps"] as? [[String: String]])?.first?["id"] == "transient")
+        try fixture.request(title: "ghostty-task-plan-v1", id: "unknown", payload: [
+            "operation": "update_step", "stepId": "stale-id", "status": "completed"
+        ])
+        let error = try #require(try fixture.response("unknown")["error"] as? String)
+        #expect(error.contains("Unknown step ID \"stale-id\""))
+        #expect(error.contains("Existing step IDs: transient"))
+        #expect(error.contains("Current investigation plan:"))
+        #expect(error.contains("\"status\":\"pending\""))
+        #expect((try fixture.response("unknown")["task"] as? [String: Any])?["id"] as? String == plan.id.uuidString)
+        #expect(fixture.model.taskPlan == plan)
+        #expect(try Data(contentsOf: history) == saved)
+    }
+
+    @Test func newConversationAndAnotherSurfaceCannotContinueThePreviousPlan() throws {
+        let fixture = try WorkbenchModelFixture()
+        defer { fixture.remove() }
+        fixture.begin("Original investigation")
+        try fixture.request(title: "ghostty-task-plan-v1", id: "custom", payload: [
+            "operation": "set_plan", "steps": [["id": "transient", "title": "Inspect process"]]
+        ])
+        fixture.model.receive(["type": "agent_settled"])
+        let original = try #require(fixture.model.taskPlan)
+        #expect(fixture.model.reset())
+        #expect(fixture.model.taskPlan == nil)
+        fixture.begin("New investigation")
+        let fresh = try #require(fixture.model.taskPlan)
+        #expect(fresh.id != original.id)
+        #expect(fresh.steps.map(\.id) == ["inspect", "diagnose", "verify"])
+        fixture.model.receive(["type": "agent_settled"])
+        let surface = UUID()
+        fixture.model.present(surfaceID: surface, directory: fixture.directory.path, selection: nil)
+        #expect(fixture.model.taskPlan == nil)
+        fixture.begin("请继续")
+        let rebound = try #require(fixture.model.taskPlan)
+        #expect(rebound.id != fresh.id)
+        #expect(rebound.surfaceID == surface)
+        #expect(rebound.steps.map(\.id) == ["inspect", "diagnose", "verify"])
+        #expect(rebound.verification.status == "pending")
     }
 
     @Test func mcpRequiresItsOwnApprovalThenActuallyInvokesConfiguredStdioTools() async throws {
@@ -304,6 +393,9 @@ struct TerminalAIWorkbenchModelTests {
         if message.get('type') == 'get_state':
             send({'type':'response','id':message['id'],'success':True,'data':{'model':{'provider':'fixture','id':'fixture'}}})
         elif message.get('type') == 'prompt':
+            if message.get('message', '').startswith('/_ghostty_begin_work_segment '):
+                send({'type':'response','id':message['id'],'success':True,'data':{'disposition':'handled'}})
+                continue
             send({'type':'response','id':message['id'],'success':True})
             send({'type':'tool_execution_start','toolCallId':'proposal','toolName':'ghostty_propose_command'})
             send({'type':'tool_execution_end','toolCallId':'proposal','isError':False,'result':{'content':[{'type':'text','text':'fixture command'}],'details':{'command':'echo old-target','explanation':'Old target fixture'}}})
@@ -316,6 +408,9 @@ struct TerminalAIWorkbenchModelTests {
 @MainActor
 private final class WorkbenchModelRecording {
     var commands: [[String: Any]] = []
+    var humanPrompts: [[String: Any]] {
+        commands.filter { $0["type"] as? String == "prompt" && !($0["message"] as? String ?? "").hasPrefix("/_ghostty_") }
+    }
     func hasResponse(_ id: String) -> Bool { commands.contains { $0["type"] as? String == "extension_ui_response" && $0["id"] as? String == id } }
 }
 
