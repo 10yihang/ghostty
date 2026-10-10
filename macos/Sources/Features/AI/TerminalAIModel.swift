@@ -246,6 +246,8 @@ final class TerminalAIModel: ObservableObject {
     private var guardianReady = false
     private var diagnosticPaused = false
     private var reviewUserMessages: [String] = []
+    /// At most one outer recovery after a review fault, reset only by human input or a valid verdict.
+    private var consecutiveReviewFailures = 0
     private let builtinPluginDirectory: URL
     private var systemQueryRecords: [UUID: [UInt64: SystemQueryRecord]] = [:]
     private var ownedTerminalSequence: UInt64?
@@ -517,6 +519,7 @@ final class TerminalAIModel: ObservableObject {
                 // was opened. Reload only after owning the writer lease.
                 let latest = try historyStore.read(id: conversationID)
                 messages = latest.messages.compactMap(Self.historyMessage)
+                reviewUserMessages = latest.nativeUserMessages
                 conversationModelLabel = latest.entry.model
                 // Refresh the authoritative plan after taking the writer lease.
                 // Explicitly selected context in this panel remains a user draft.
@@ -541,7 +544,8 @@ final class TerminalAIModel: ObservableObject {
         startedAt = Date()
         setPhase(.starting, "Starting Pi")
         let question = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        reviewUserMessages = [question]
+        reviewUserMessages.append(question)
+        consecutiveReviewFailures = 0
         isPiMCPStatusTask = mode == .assistant && question == "/mcp"
         if !isPiMCPStatusTask {
             suggestedCommand = ""
@@ -615,6 +619,7 @@ final class TerminalAIModel: ObservableObject {
         messages.append(ConversationMessage(id: input.id, role: "user", content: [0: .text(question)]))
         guard saveConversation() else {
             messages.removeLast()
+            reviewUserMessages.removeLast()
             isRunning = false
             error = historyError
             setPhase(.failed, "Could not save conversation")
@@ -656,6 +661,7 @@ final class TerminalAIModel: ObservableObject {
         }
         let inputID = UUID().uuidString
         reviewUserMessages.append(text)
+        consecutiveReviewFailures = 0
         cancelApprovalReview(reason: "The user updated the task. Review the action again with the new instructions.")
         if terminalRequestID != nil, ownedTerminalSequence == nil {
             cancelTerminalRequest(reason: "The user updated the task before command dispatch. Request a new review.", interrupt: false)
@@ -668,6 +674,7 @@ final class TerminalAIModel: ObservableObject {
             try beginDiagnosticSegment(message: text)
             let id = try request("prompt", fields: ["message": text, "streamingBehavior": deliveryMode == "steer" ? "steer" : "followUp"])
             if let index = pendingInputs.firstIndex(where: { $0.id == inputID }) { pendingInputs[index].requestID = id }
+            scheduleHistorySave()
         } catch {
             fail(error.localizedDescription)
         }
@@ -734,6 +741,8 @@ final class TerminalAIModel: ObservableObject {
         requiresSavedSession = false
         signature = []
         messages = []
+        reviewUserMessages = []
+        consecutiveReviewFailures = 0
         attachments = []
         taskPlan = nil
         suggestedCommand = ""
@@ -778,6 +787,7 @@ final class TerminalAIModel: ObservableObject {
             activeModelLabel = snapshot.entry.model
             requiresSavedSession = true
             messages = snapshot.messages.compactMap(Self.historyMessage)
+            reviewUserMessages = snapshot.nativeUserMessages
             if let saved = Self.savedWorkbench(snapshot.workbench) {
                 attachments = saved.attachments
                 taskPlan = saved.task
@@ -833,7 +843,7 @@ final class TerminalAIModel: ObservableObject {
             let data = try JSONEncoder().encode(TerminalAISavedWorkbench(attachments: attachments, task: taskPlan))
             let saved = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             try historyStore.save(.init(entry: entry, messages: serializedMessages,
-                                       phase: phase.rawValue, workbench: saved))
+                                       phase: phase.rawValue, workbench: saved, nativeUserMessages: reviewUserMessages))
             history.removeAll { $0.id == entry.id }
             history.insert(entry, at: 0)
             historyError = nil
@@ -1893,7 +1903,7 @@ extension TerminalAIModel {
                     reviewPromptID = nil
                     if record["success"] as? Bool != true ||
                         (record["data"] as? [String: Any])?["disposition"] as? String != "handled" {
-                        completeApprovalReview(.ask("The automatic reviewer could not handle this action."))
+                        completeApprovalReview(.failed(.unavailable, "The automatic reviewer could not handle this action.", retryable: false))
                     }
                 }
                 return
@@ -2253,6 +2263,10 @@ extension TerminalAIModel {
         operation: ReviewOperation, action: TerminalAIApprovalReview.Action, narrowScopeEvidence: String? = nil
     ) -> Bool {
         guard isAutomaticReviewEnabled, guardianReady, pendingReview == nil, isRunning, !stopping else { return false }
+        guard consecutiveReviewFailures < 2 else {
+            rejectReviewedOperation(operation, reason: "Automatic review recovery is exhausted. The action was not executed. Do not retry automatically; explain the review failure and ask the user how to continue.")
+            return true
+        }
         let terminalTarget = currentTerminalTarget()
         let workspace = URL(fileURLWithPath: workingDirectory).resolvingSymlinksInPath().path
         let target: TerminalAIApprovalReview.Target
@@ -2265,7 +2279,7 @@ extension TerminalAIModel {
         }
         do {
             let request = try TerminalAIApprovalReview.Request(
-                context: .init(userMessages: reviewUserMessages, target: target), action: action,
+                context: .init(userMessages: reviewUserMessages, target: target, assistantMessages: reviewAssistantMessages), action: action,
                 generation: generation.uuidString, narrowScopeEvidence: narrowScopeEvidence)
             let argument = try request.base64Argument()
             respondToApproval(allow: false)
@@ -2282,15 +2296,16 @@ extension TerminalAIModel {
                 // Leave time for its correlated result to cross the native bridge.
                 try? await Task.sleep(for: .seconds(105))
                 guard !Task.isCancelled, let self, self.pendingReview?.request.reviewId == request.reviewId else { return }
-                self.completeApprovalReview(.ask("The automatic approval review timed out."))
+                self.completeApprovalReview(.failed(.timeout, "The automatic approval review timed out.", retryable: true))
             }
             return true
         } catch {
             if pendingReview != nil {
-                completeApprovalReview(.ask("The automatic reviewer is unavailable: \(error.localizedDescription)"))
+                completeApprovalReview(.failed(.unavailable, "The automatic reviewer connection is unavailable.", retryable: false))
                 return true
             }
-            return false
+            presentManualReview(operation, reason: error.localizedDescription)
+            return true
         }
     }
 
@@ -2316,12 +2331,26 @@ extension TerminalAIModel {
             return
         }
         switch decision {
+        case .failed(let code, let reason, let permitsRetry):
+            consecutiveReviewFailures = permitsRetry ? consecutiveReviewFailures + 1 : 2
+            let retryable = permitsRetry && consecutiveReviewFailures < 2
+            let guidance = retryable ? "You may retry the original action once, with a fresh native review, or explain the failure and ask the user." :
+                "Do not retry automatically. Explain the review failure and ask the user how to continue."
+            let feedback = "Automatic review failed (\(code.rawValue)). The action was not executed. \(reason) \(guidance)"
+            receivePluginMessage(["role": "custom", "customType": "Codex Guardian", "display": true,
+                                  "timestamp": UUID().uuidString,
+                                  "content": "Review failed · \(code.rawValue)\n\(feedback)\nReview duration: \(pending.elapsedSeconds)s"])
+            if case .file = pending.operation { fileRequestID = nil }
+            sendTerminalResult(id: pending.operation.id, value: ["error": feedback, "reviewFailure": code.rawValue, "retryable": retryable])
+            activity(.thinking, "Thinking")
         case .ask(let reason):
             presentManualReview(pending.operation, reason: "\(reason)\nReview duration: \(pending.elapsedSeconds)s")
         case .deny(let assessment):
+            consecutiveReviewFailures = 0
             recordApprovalReview(assessment, allowed: false, durationSeconds: pending.elapsedSeconds)
             rejectReviewedOperation(pending.operation, reason: "Automatic review denied this action (\(assessment.riskLevel.rawValue)): \(assessment.rationale)")
         case .approve(let assessment):
+            consecutiveReviewFailures = 0
             recordApprovalReview(assessment, allowed: true, durationSeconds: pending.elapsedSeconds)
             terminalControlAllowed = false
             switch pending.operation {
@@ -2336,6 +2365,20 @@ extension TerminalAIModel {
                 if !stopping { activity(.thinking, "Thinking") }
             }
         }
+    }
+
+    private var reviewAssistantMessages: [String] {
+        var excerpts: [String] = []
+        for message in messages.reversed() where message.role == "assistant" {
+            let text = message.content.keys.sorted().compactMap { index -> String? in
+                if case .text(let value) = message.content[index] { return value }
+                return nil
+            }.joined(separator: "\n")
+            guard !text.isEmpty, !text.hasPrefix("Codex Guardian\n\n") else { continue }
+            excerpts.append(String(decoding: text.utf16.prefix(4_096), as: UTF16.self))
+            if excerpts.count == 4 { break }
+        }
+        return excerpts.reversed()
     }
 
     private func recordApprovalReview(_ assessment: TerminalAIApprovalReview.Assessment, allowed: Bool, durationSeconds: Int) {

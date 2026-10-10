@@ -18,6 +18,8 @@ struct TerminalAIHistoryStore {
         var messages: [[String: Any]]
         var phase: String
         var workbench: [String: Any]?
+        /// Only native input populates this authority history. Pi transcript roles are not proof of human authorship.
+        var nativeUserMessages: [String] = []
     }
 
     enum StoreError: LocalizedError, Equatable {
@@ -67,7 +69,16 @@ struct TerminalAIHistoryStore {
               let phase = value["phase"] as? String,
               Self.validMessages(messages), entry.messageCount == messages.count,
               entry.updatedAt.timeIntervalSince1970.isFinite else { throw StoreError.corrupt }
-        return Snapshot(entry: entry, messages: messages, phase: phase, workbench: value["workbench"] as? [String: Any])
+        let nativeUserMessages: [String]
+        if let stored = value["nativeUserMessages"] {
+            guard let messages = stored as? [String] else { throw StoreError.corrupt }
+            nativeUserMessages = messages
+        } else {
+            // Older transcripts can contain prompts inserted by Pi extensions. Do not promote their user roles.
+            nativeUserMessages = []
+        }
+        return Snapshot(entry: entry, messages: messages, phase: phase, workbench: value["workbench"] as? [String: Any],
+                        nativeUserMessages: nativeUserMessages)
     }
 
     func save(_ snapshot: Snapshot) throws {
@@ -78,7 +89,8 @@ struct TerminalAIHistoryStore {
         let metadata = try JSONSerialization.jsonObject(with: encoder.encode(snapshot.entry))
         var document: [String: Any] = [
             "schemaVersion": 1, "entry": metadata,
-            "messages": snapshot.messages, "phase": snapshot.phase
+            "messages": snapshot.messages, "phase": snapshot.phase,
+            "nativeUserMessages": snapshot.nativeUserMessages
         ]
         if let workbench = snapshot.workbench { document["workbench"] = workbench }
         guard JSONSerialization.isValidJSONObject(document) else { throw StoreError.corrupt }

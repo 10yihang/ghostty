@@ -25,6 +25,8 @@ enum TerminalAIApprovalReview {
         /// Only original human messages captured by the native UI belong here.
         let userMessages: [String]
         let target: Target
+        /// Recent assistant excerpts explain replies such as "yes"; they never grant authority.
+        var assistantMessages: [String] = []
     }
 
     struct Action: Encodable, Equatable, Sendable {
@@ -89,11 +91,13 @@ enum TerminalAIApprovalReview {
 
         var canReview: Bool {
             evidenceComplete && action.isComplete && !generation.isEmpty &&
-                !context.target.host.isEmpty && !context.target.directory.isEmpty
+                !context.target.host.isEmpty && !context.target.directory.isEmpty &&
+                context.userMessages.allSatisfy { $0.utf16.count <= 32_768 } &&
+                context.assistantMessages.count <= 4 && context.assistantMessages.allSatisfy { $0.utf16.count <= 4_096 }
         }
 
         func base64Argument() throws -> String {
-            guard canReview else { throw issue("The review evidence is incomplete. Use individual approval.") }
+            guard canReview else { throw issue("The complete action and human context exceed review evidence limits or are incomplete. Use individual approval.") }
             let data = try canonicalData(self)
             guard data.count <= maximumRequestBytes else {
                 throw issue("The complete action exceeds the review limit. Use individual approval.")
@@ -117,6 +121,18 @@ enum TerminalAIApprovalReview {
         case approve(Assessment)
         case deny(Assessment)
         case ask(String)
+        case failed(FailureCode, String, retryable: Bool)
+    }
+
+    enum FailureCode: String, Decodable, Sendable {
+        case timeout, cancelled, request, credentials, provider, assessment, truncated, evidence, authorization, unavailable
+
+        var permitsRetry: Bool {
+            switch self {
+            case .timeout, .provider, .assessment, .truncated: return true
+            default: return false
+            }
+        }
     }
 
     /// A late verdict must not consume a different pending review, even as a fallback.
@@ -141,7 +157,8 @@ enum TerminalAIApprovalReview {
         }
         let envelopeKeys: Set<String> = ["version", "reviewId", "nonce", "actionDigest", "generation"]
         let keys = Set(object.keys)
-        guard keys == envelopeKeys.union(["assessment"]) || keys == envelopeKeys.union(["error"]),
+        guard keys == envelopeKeys.union(["assessment"]) || keys == envelopeKeys.union(["error"]) ||
+                keys == envelopeKeys.union(["error", "failureCode", "retryable"]),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: Data(json.utf8)),
               envelope.version == request.version, envelope.reviewId == request.reviewId,
               envelope.nonce == request.nonce, envelope.actionDigest == request.actionDigest,
@@ -151,6 +168,12 @@ enum TerminalAIApprovalReview {
         if let error = envelope.error {
             guard !error.isEmpty, error.utf8.count <= 4_096 else {
                 return .ask("The automatic approval review failed.")
+            }
+            if let code = envelope.failureCode, let retryable = envelope.retryable {
+                switch code {
+                case .request, .evidence, .authorization: return .ask(error)
+                default: return .failed(code, error, retryable: code.permitsRetry && retryable)
+                }
             }
             return .ask(error)
         }
@@ -201,6 +224,8 @@ enum TerminalAIApprovalReview {
         let generation: String
         let assessment: AssessmentPayload?
         let error: String?
+        let failureCode: FailureCode?
+        let retryable: Bool?
     }
 
     private struct AssessmentPayload: Decodable {

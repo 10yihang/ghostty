@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Testing
 import Vision
+import WebKit
 @testable import Ghostty
 
 @Suite(.serialized)
@@ -116,8 +117,11 @@ private final class PluginPresentationFixture {
     let model: TerminalAIModel
     let window: NSWindow
     let host: NSHostingView<TerminalAIView>
+    private let placement: TerminalAIPlacement
     private let records: PluginPresentationRecords
     private var ownedPopovers: [NSWindow] = []
+    private var settingsOpenCount = 0
+    private var initialComposerReady = false
 
     var sentCommands: [[String: Any]] { records.commands }
 
@@ -205,6 +209,7 @@ private final class PluginPresentationFixture {
     }
 
     init(placement: TerminalAIPlacement, packages: [String] = []) throws {
+        self.placement = placement
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ghostty-plugin-presentation-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -239,13 +244,37 @@ private final class PluginPresentationFixture {
     }
 
     func openSettings() async throws {
+        settingsOpenCount += 1
         window.makeKey()
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(200))
-        try preview("panel", view: host)
-        // The header's native event handler tracks the release inside mouse-down.
-        click(window, NSPoint(x: host.bounds.width - 94, y: host.bounds.height - 16), trackingButton: true)
-        try await wait("The actual AI settings gear did not open its popover") { settingsPopover != nil }
+        if !initialComposerReady {
+            let webView = try #require(descendants(host).compactMap { $0 as? WKWebView }.first)
+            // Native ready and React's initial focus are separate messages.
+            // Settle both before testing the real settings gear so late
+            // composer focus cannot dismiss its popover after the click.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !initialComposerReady {
+                let focused = (try? await webView.evaluateJavaScript("document.activeElement?.getAttribute('aria-label') === 'Message AI'")) as? Bool == true
+                initialComposerReady = !webView.isLoading && window.firstResponder === webView && focused
+                guard ContinuousClock.now < deadline else {
+                    throw NSError(domain: "PluginPresentationFixture", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "The owned conversation did not finish its initial ready/focus handshake"])
+                }
+                if !initialComposerReady { try await Task.sleep(for: .milliseconds(20)) }
+            }
+        }
+        try preview("panel-\(placement.rawValue)-\(settingsOpenCount)", view: host)
+        // Drive the actual native control in this owned background window;
+        // raw mouse tracking otherwise depends on application activation.
+        let gearPoint = NSPoint(x: host.bounds.width - 94, y: host.bounds.height - 16)
+        let controls = descendants(host).compactMap { $0 as? NSButton }.filter {
+            $0.convert($0.bounds, to: nil).contains(gearPoint)
+        }
+        try #require(controls.count == 1)
+        let gear = try #require(controls.first)
+        try #require(gear.window === window && gear.isEnabled)
+        gear.performClick(nil)
+        try await wait("The actual AI settings gear did not open its popover (\(placement.rawValue), open \(settingsOpenCount), key \(window.isKeyWindow))") { settingsPopover != nil }
         try preview("settings", view: try #require(settingsPopover?.contentView))
     }
 

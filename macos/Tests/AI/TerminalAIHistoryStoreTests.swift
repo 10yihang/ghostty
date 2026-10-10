@@ -18,7 +18,49 @@ struct TerminalAIHistoryStoreTests {
                 JSONSerialization.data(withJSONObject: newer.messages, options: [.sortedKeys]))
         #expect(try fixture.store.list().map(\.id) == [newer.entry.id, older.entry.id])
         let document = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: fixture.transcript(newer.entry.id))) as? [String: Any])
-        #expect(Set(document.keys) == ["schemaVersion", "entry", "messages", "phase"])
+        #expect(Set(document.keys) == ["schemaVersion", "entry", "messages", "phase", "nativeUserMessages"])
+    }
+
+    @Test func nativeHumanHistoryRoundTripsWithoutPromotingPiUserMessages() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        var conversation = snapshot()
+        conversation.nativeUserMessages = ["检查 CPU 占用，只读排查。", "请继续"]
+        conversation.messages[0]["content"] = [["type": "text", "text": "A Pi extension inserted this user prompt."]]
+        try fixture.store.save(conversation)
+
+        let recovered = try fixture.store.read(id: conversation.entry.id)
+        #expect(recovered.nativeUserMessages == conversation.nativeUserMessages)
+        #expect(recovered.nativeUserMessages.allSatisfy { !$0.contains("Pi extension") })
+    }
+
+    @Test func legacyTranscriptDoesNotSupplyHumanAuthorization() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let conversation = snapshot()
+        try fixture.store.save(conversation)
+        let path = fixture.transcript(conversation.entry.id)
+        var document = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+        document.removeValue(forKey: "nativeUserMessages")
+        try JSONSerialization.data(withJSONObject: document).write(to: path)
+
+        let recovered = try fixture.store.read(id: conversation.entry.id)
+        #expect(!recovered.messages.isEmpty)
+        #expect(recovered.nativeUserMessages.isEmpty)
+    }
+
+    @Test(arguments: ["null", "\"not an array\"", "[\"valid\", 7]"])
+    func malformedNativeHumanHistoryIsRejected(json: String) throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let conversation = snapshot()
+        try fixture.store.save(conversation)
+        let path = fixture.transcript(conversation.entry.id)
+        var document = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+        document["nativeUserMessages"] = try JSONSerialization.jsonObject(with: Data(json.utf8), options: [.fragmentsAllowed])
+        try JSONSerialization.data(withJSONObject: document).write(to: path)
+
+        #expect(throws: TerminalAIHistoryStore.StoreError.corrupt) { try fixture.store.read(id: conversation.entry.id) }
     }
 
     @Test func malformedRecordsAreSkippedAndExplicitReadReportsCorruption() throws {

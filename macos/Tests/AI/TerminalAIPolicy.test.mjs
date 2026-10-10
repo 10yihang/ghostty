@@ -98,6 +98,10 @@ test("selected trusted extensions enable only registered custom tools and leave 
   assert.match(description, /not sandboxed or bound to the terminal/);
   assert.match(description, /real filesystem/);
   assert.match(description, /native approval rules still apply/);
+  assert.match(description, /review failure does not execute the requested action or prove it unsafe/);
+  assert.match(description, /native feedback explicitly permits a retry.*exact original action once/);
+  assert.match(description, /do not split, rephrase or change its arguments to reset that limit/);
+  assert.match(description, /Never retry a denied or cancelled action, a changed target, or an unverified shell prompt/);
 });
 
 test("unselected extensions keep native tools and command mode never grants plugin tools", async () => {
@@ -1059,6 +1063,7 @@ test("Pi SDK budgets native human work segments, excludes wall-clock waits and o
 
 test("real Pi RPC advertises native bridges and scoped SDK tools and consumes results, failures, and denied access", async () => {
   const requests = [];
+  const guardianAttempts = new Map();
   const nativeKeys = await nativeTerminalKeyPolicy();
   const rpcFile = path.join(workspace, "rpc-sdk.txt");
   await fs.writeFile(rpcFile, "RPC SDK local file evidence\n");
@@ -1071,6 +1076,7 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
     requests.push(input);
     const user = [...input.messages].reverse().find((message) => message.role === "user")?.content;
     const marker = typeof user === "string" ? user : JSON.stringify(user);
+    const guardianCommand = marker.match(/__(guardian_(?:retry_once|retry_exhausted|unavailable))__/)?.[1];
     const last = input.messages.at(-1);
     let delta;
     let finish = "stop";
@@ -1080,6 +1086,9 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
       if (marker.includes("__terminal_read_ordered__")) {
         name = "ghostty_terminal";
         args = { reason: "查看终端当前状态，确认 shell 就绪", operation: "read" };
+      } else if (guardianCommand) {
+        name = "ghostty_terminal";
+        args = { operation: "run", command: guardianCommand, reason: "Exercise bounded review recovery in the current terminal.", timeout: 12 };
       } else if (marker.includes("__file_read__")) {
         name = "read";
         args = { path: "rpc-sdk.txt" };
@@ -1127,6 +1136,12 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
         args = { operation: "read" };
       }
       delta = { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] };
+      finish = "tool_calls";
+    } else if (guardianCommand && String(last.content).includes("The requested action was not executed.")) {
+      const retry = String(last.content).includes("You may retry this exact action once.");
+      delta = { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name: "ghostty_terminal", arguments: JSON.stringify(retry ? {
+        operation: "run", command: guardianCommand, reason: "Exercise bounded review recovery in the current terminal.", timeout: 12,
+      } : { operation: "read", reason: "Read existing evidence after review recovery was exhausted; do not execute the blocked command." }) } }] };
       finish = "tool_calls";
     } else if (marker.includes("__verify__") && String(last.content).includes("Command record:")) {
       // The provider sees content only. Never derive the ID from Pi's private details or the fixture variable.
@@ -1202,7 +1217,18 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
         const validKeys = Object.keys(request).every((key) => nativeKeys[request.operation]?.has(key));
         const failed = request.command === "fixture_terminal_failure";
         const denied = request.command === "touch forbidden";
-        const result = !validKeys ? { output: "", error: "Invalid terminal request." } : denied ? { output: "", error: "Terminal command was denied by the native host." } : {
+        let reviewFailure;
+        if (request.command?.startsWith("guardian_")) {
+          const attempt = (guardianAttempts.get(request.command) ?? 0) + 1;
+          guardianAttempts.set(request.command, attempt);
+          const retryable = attempt === 1 && request.command !== "guardian_unavailable";
+          if (request.command !== "guardian_retry_once" || attempt === 1) reviewFailure = {
+            output: "", reviewFailure: request.command === "guardian_unavailable" ? "credentials" : "timeout", retryable,
+            error: "Automatic approval review failed. The requested action was not executed. " +
+              (retryable ? "You may retry this exact action once." : "Do not retry this action again. Summarize the evidence and ask the user how to continue."),
+          };
+        }
+        const result = !validKeys ? { output: "", error: "Invalid terminal request." } : denied ? { output: "", error: "Terminal command was denied by the native host." } : reviewFailure ?? {
           output: request.operation === "read" ? "fixture current terminal context" : failed ? "fixture terminal failure" : "fixture terminal output",
           ...(request.operation === "run" ? { exitCode: failed ? 9 : 0 } : {}),
           ...(request.command === "fixture_verification_check" ? { commandId: verificationRecordID } : {}),
@@ -1247,7 +1273,7 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
   });
   try {
     await wait((record) => record.type === "extension_ui_request" && record.method === "setStatus" && record.statusKey === "ghostty-policy" && record.statusText === "ready");
-    for (const marker of ["__terminal_read_ordered__", "__file_read__", "__file_write__", "__file_write_deny__", "__inspect_cpu__", "__suggest__", "__deny__", "__terminal__", "__terminal_fail__", "__legacy_run__", "__legacy_diagnose__", "__mcp__", "__mcp_fail__", "__mcp_deny__", "__plan__", "__context__", "__verify__", "__context_list__"]) {
+    for (const marker of ["__terminal_read_ordered__", "__file_read__", "__file_write__", "__file_write_deny__", "__inspect_cpu__", "__guardian_retry_once__", "__guardian_retry_exhausted__", "__guardian_unavailable__", "__suggest__", "__deny__", "__terminal__", "__terminal_fail__", "__legacy_run__", "__legacy_diagnose__", "__mcp__", "__mcp_fail__", "__mcp_deny__", "__plan__", "__context__", "__verify__", "__context_list__"]) {
       records.length = 0;
       const requestStart = requests.length;
       send({ type: "prompt", id: marker, message: marker });
@@ -1270,6 +1296,20 @@ test("real Pi RPC advertises native bridges and scoped SDK tools and consumes re
         const nativeInput = records.find((record) => record.type === "extension_ui_request" && record.title === "ghostty-terminal-v1");
         assert.deepEqual(JSON.parse(nativeInput.placeholder), { operation: "read" });
         assert.ok(turnRequests.some((request) => request.messages.at(-1).role === "tool" && String(request.messages.at(-1).content).includes("fixture current terminal context")));
+      } else if (marker.startsWith("__guardian_")) {
+        const inputs = records.filter((record) => record.type === "extension_ui_request" && record.title === "ghostty-terminal-v1").map((record) => JSON.parse(record.placeholder));
+        const retries = marker !== "__guardian_unavailable__";
+        const recovered = marker === "__guardian_retry_once__";
+        assert.equal(guardianAttempts.get(marker.slice(2, -2)), retries ? 2 : 1);
+        assert.deepEqual(inputs.filter((request) => request.operation === "run").map(({ command, timeout }) => ({ command, timeout })),
+          Array.from({ length: retries ? 2 : 1 }, () => ({ command: marker.slice(2, -2), timeout: 12 })), "Recovery does not rewrite or split the command");
+        if (retries) assert.deepEqual(inputs[1], inputs[0], "The retry preserves the complete native action payload");
+        assert.equal(inputs.at(-1).operation, recovered ? "run" : "read");
+        assert.equal(executions[0].isError, true);
+        assert.match(textContent(executions[0].result), /The requested action was not executed/);
+        assert.equal(executions.at(-1).isError, false, "A review infrastructure error does not abort the main agent's loop");
+        assert.equal(executions.filter((record) => record.isError).length, marker === "__guardian_retry_exhausted__" ? 2 : 1);
+        assert.ok(turnRequests.some((request) => request.messages.at(-1).role === "tool" && String(request.messages.at(-1).content).includes("The requested action was not executed.")), "The main model consumed native non-execution feedback");
       } else if (marker.startsWith("__file_")) {
         assert.equal(executions.length, 1);
         assert.equal(executions[0].toolName, marker === "__file_read__" ? "read" : "write");

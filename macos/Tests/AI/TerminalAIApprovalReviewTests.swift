@@ -5,6 +5,42 @@ import Testing
 struct TerminalAIApprovalReviewTests {
     private typealias Review = TerminalAIApprovalReview
 
+    @Test func longHumanConversationUsesTheByteBudgetWithoutDroppingEarlierRestrictions() throws {
+        let messages = ["Only inspect; never delete files"] + Array(repeating: "Continue", count: 120)
+        let pending = try Review.Request(context: .init(userMessages: messages, target: context().target),
+                                         action: .terminal(command: "ps -ef", reason: "Inspect", timeoutSeconds: 30), generation: "run")
+        #expect(pending.canReview)
+        let data = try #require(Data(base64Encoded: pending.base64Argument()))
+        let packet = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect((packet["context"] as? [String: Any])?["userMessages"] as? [String] == messages)
+    }
+
+    @Test func typedServiceFailureIsDistinctFromRiskAndLegacyFallback() throws {
+        let pending = try request()
+        for code in ["timeout", "provider", "assessment", "truncated", "credentials", "cancelled", "unavailable"] {
+            let json = try verdict(pending, envelopeChanges: ["assessment": nil, "error": "Controlled review failure",
+                                                            "failureCode": code, "retryable": true])
+            guard case .failed(let failure, _, let retryable) = Review.verify(json, for: pending) else {
+                Issue.record("Infrastructure failure \(code) became an approval prompt.")
+                continue
+            }
+            #expect(failure.rawValue == code)
+            #expect(retryable == ["timeout", "provider", "assessment", "truncated"].contains(code))
+            #expect(isAsk(Review.verify(try verdict(pending, envelopeChanges: ["assessment": nil, "error": "Controlled",
+                        "failureCode": code, "retryable": true, "nonce": "wrong-nonce"]), for: pending)))
+        }
+        for code in ["request", "evidence", "authorization", "unrecognized"] {
+            #expect(isAsk(Review.verify(try verdict(pending, envelopeChanges: ["assessment": nil, "error": "Needs review",
+                                       "failureCode": code, "retryable": true]), for: pending)))
+        }
+        let rejectedProvider = try verdict(pending, envelopeChanges: ["assessment": nil, "error": "HTTP 422",
+                                               "failureCode": "provider", "retryable": false])
+        #expect(Review.verify(rejectedProvider, for: pending) == .failed(.provider, "HTTP 422", retryable: false))
+        #expect(isAsk(Review.verify(try verdict(pending, envelopeChanges: ["assessment": nil, "error": "Legacy failure"]), for: pending)))
+        #expect(isAsk(Review.verify(try verdict(pending, envelopeChanges: ["assessment": nil, "error": "Invalid flag",
+                                   "failureCode": "provider", "retryable": "true"]), for: pending)))
+    }
+
     @Test func frozenPacketBindsFullActionHumanContextAndGeneration() throws {
         let first = try request()
         let second = try request()
