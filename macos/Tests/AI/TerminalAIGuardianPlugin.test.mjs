@@ -149,6 +149,19 @@ test("a transient Guardian HTTP 503 retries once before accepting a completed as
   assert.deepEqual(result, assessment());
 });
 
+test("a completed review after the former 20-second deadline still supplies a valid assessment", { timeout: 30000 }, async () => {
+  const result = await assessRequest(request(), context(), { complete: (_model, _review, { signal }) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(message(assessment()));
+      }, 21000);
+      const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }) });
+  assert.deepEqual(result, assessment());
+});
+
 test("Guardian transport retry stays bounded and 401 or missing credentials never retry", async () => {
   const packagePath = process.env.GHOSTTY_PI_PACKAGE || "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent";
   const { completeSimple } = await import(pathToFileURL(path.join(packagePath, "node_modules/@earendil-works/pi-ai/dist/compat.js")));

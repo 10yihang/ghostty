@@ -120,7 +120,7 @@ function parseAssessment(json) {
   return value;
 }
 
-export async function assessRequest(request, ctx, { complete, timeoutMs = 20000 } = {}) {
+export async function assessRequest(request, ctx, { complete, timeoutMs = 90000 } = {}) {
   const normalized = normalizeRequest(request);
   if (!ctx.model || typeof complete !== "function") throw new GuardianFailure("unavailable", "No review model is available.");
   const signal = AbortSignal.any([...(ctx.signal ? [ctx.signal] : []), AbortSignal.timeout(timeoutMs)]);

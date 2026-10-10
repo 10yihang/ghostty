@@ -36,6 +36,40 @@ struct TerminalAIGuardianModelTests {
         #expect(try fixture.response("late-replay")["error"] is String)
     }
 
+    @Test func correlatedReviewAfterThirtySecondsExecutesWithoutManualApproval() async throws {
+        let fixture = try GuardianModelFixture(enabled: true)
+        defer { fixture.close() }
+        fixture.begin("Create only the requested fixture marker")
+        // The executing agent accepted the public prompt before its tool waits
+        // for the separate private review. Its 15-second acceptance timer must
+        // not determine the review's lifetime.
+        let prompt = try #require(fixture.recording.commands.last {
+            $0["type"] as? String == "prompt" && !($0["message"] as? String ?? "").hasPrefix("/_ghostty_")
+        })
+        fixture.model.receive(["type": "response", "id": try #require(prompt["id"] as? String), "success": true])
+        try fixture.terminalRequest(id: "terminal", command: "touch requested-marker")
+        let review = try fixture.review()
+        var manualReviewObserved = false
+        for _ in 0..<31 {
+            try await Task.sleep(for: .seconds(1))
+            manualReviewObserved = manualReviewObserved || fixture.model.approval != nil
+        }
+        #expect(fixture.model.isRunning && fixture.model.error == nil,
+                "The accepted main prompt must remain active throughout the isolated review.")
+        #expect(!manualReviewObserved,
+                "The host must keep waiting for a correlated review after 30 seconds: \(fixture.model.statusLabel)")
+        #expect(fixture.recording.operations.isEmpty)
+        try fixture.deliver(review)
+        try await fixture.wait { fixture.hasResponse("terminal") || fixture.model.approval != nil }
+        #expect(fixture.model.approval == nil)
+        #expect(fixture.recording.operations.count == 1)
+        #expect(fixture.responseCount("terminal") == 1)
+        #expect(fixture.recording.operations.first?["command"] as? String == "touch requested-marker")
+        let duration = fixture.model.response.components(separatedBy: "Review duration: ").last?
+            .split(separator: "s").first.flatMap { Int($0) }
+        #expect((duration ?? 0) >= 31)
+    }
+
     @Test func approvedFileAppliesTheFrozenNativeDiffExactlyOnce() async throws {
         let fixture = try GuardianModelFixture(enabled: true)
         defer { fixture.close() }

@@ -30,13 +30,16 @@ the reviewed diff. Stop, manual terminal input, changed task instructions,
 terminal changes and connection shutdown invalidate pending reviews. A timeout,
 reviewer failure, malformed result or incomplete evidence uses the existing
 manual approval dialog. The chat records allowed/denied risk and rationale, plus
-the reason when automatic review falls back to manual approval.
+the reason when automatic review falls back to manual approval. Completed reviews
+also record their elapsed wait time using the native monotonic clock.
 
-Each review has one 20-second deadline, including a single transport retry for
-transient provider failures. Authentication failures and invalid assessments do
-not retry. Failure messages distinguish provider HTTP errors, unavailable
-credentials, timeout/cancellation, invalid assessments and insufficient policy
-evidence without exposing raw provider responses or credentials. A failed review
+Each review has one 90-second deadline, including a single transport retry for
+transient provider failures. The native host waits up to 105 seconds so it does
+not discard a valid review while the plugin is still working. A slow provider can
+therefore add waiting time before an action is approved. Authentication failures
+and invalid assessments do not retry. Failure messages distinguish provider HTTP
+errors, unavailable credentials, timeout/cancellation, invalid assessments and
+insufficient policy evidence without exposing raw provider responses or credentials. A failed review
 still requires manual approval.
 
 This plugin covers Ghostty-managed terminal runs and local edit/write requests.

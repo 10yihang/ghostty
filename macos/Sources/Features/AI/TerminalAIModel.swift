@@ -236,6 +236,9 @@ final class TerminalAIModel: ObservableObject {
         let operation: ReviewOperation
         let terminalTarget: TerminalTarget
         let workspace: String
+        let startedAt = ContinuousClock().now
+
+        var elapsedSeconds: Int { Int(startedAt.duration(to: ContinuousClock().now).components.seconds) }
     }
     private var pendingReview: PendingReview?
     private var reviewTimeoutTask: Task<Void, Never>?
@@ -2275,7 +2278,9 @@ extension TerminalAIModel {
             // They must not enter pendingInputs or the main prompt timeout/finish path.
             try send(["type": "prompt", "id": rpcID, "message": "/_ghostty_guardian_review \(argument)"])
             reviewTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(30))
+                // The plugin has a 90-second total deadline, including retries.
+                // Leave time for its correlated result to cross the native bridge.
+                try? await Task.sleep(for: .seconds(105))
                 guard !Task.isCancelled, let self, self.pendingReview?.request.reviewId == request.reviewId else { return }
                 self.completeApprovalReview(.ask("The automatic approval review timed out."))
             }
@@ -2312,12 +2317,12 @@ extension TerminalAIModel {
         }
         switch decision {
         case .ask(let reason):
-            presentManualReview(pending.operation, reason: reason)
+            presentManualReview(pending.operation, reason: "\(reason)\nReview duration: \(pending.elapsedSeconds)s")
         case .deny(let assessment):
-            recordApprovalReview(assessment, allowed: false)
+            recordApprovalReview(assessment, allowed: false, durationSeconds: pending.elapsedSeconds)
             rejectReviewedOperation(pending.operation, reason: "Automatic review denied this action (\(assessment.riskLevel.rawValue)): \(assessment.rationale)")
         case .approve(let assessment):
-            recordApprovalReview(assessment, allowed: true)
+            recordApprovalReview(assessment, allowed: true, durationSeconds: pending.elapsedSeconds)
             terminalControlAllowed = false
             switch pending.operation {
             case .terminal(let id, let payload, let target):
@@ -2333,10 +2338,10 @@ extension TerminalAIModel {
         }
     }
 
-    private func recordApprovalReview(_ assessment: TerminalAIApprovalReview.Assessment, allowed: Bool) {
+    private func recordApprovalReview(_ assessment: TerminalAIApprovalReview.Assessment, allowed: Bool, durationSeconds: Int) {
         receivePluginMessage(["role": "custom", "customType": "Codex Guardian", "display": true,
                               "timestamp": UUID().uuidString,
-                              "content": "\(allowed ? "Allowed" : "Denied") · \(assessment.riskLevel.rawValue) risk\n\(assessment.rationale)"])
+                              "content": "\(allowed ? "Allowed" : "Denied") · \(assessment.riskLevel.rawValue) risk\n\(assessment.rationale)\nReview duration: \(durationSeconds)s"])
     }
 
     private func cancelApprovalReview(reason: String) {
